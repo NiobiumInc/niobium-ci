@@ -52,7 +52,7 @@ sequenceDiagram
   Dev->>Caller: trigger
   Caller->>RW: uses @pin (inputs + secrets)
   RW->>Repo: checkout, init the shared submodule
-  RW->>RW: resolve diff base; skip if nothing in scope changed
+  RW->>RW: resolve diff base, skip if nothing in scope changed
   RW->>Repo: run build-command (the only step holding a secret)
   RW->>Repo: run make clang-tidy — the developer's command
   Repo-->>RW: report
