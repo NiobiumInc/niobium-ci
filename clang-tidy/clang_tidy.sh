@@ -323,7 +323,7 @@ SH
 }
 
 case "$MODE" in
-    check-tool) check_tool ;;
+    check-tool) check_tool || exit "$EX_NOVERDICT" ;;
     # The pre-flight checks mean the analysis did not run, so they exit 2 rather than
     # falling through as if the code were clean.
     diff)       check_tool && check_scope && check_compile_db || exit "$EX_NOVERDICT"

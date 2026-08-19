@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# This repository's own CI. What ships from here runs in every consumer's pipeline
+# and on every developer's machine, so a regression escapes to more places than a
+# change to any single project would.
+#
+# It runs on GitHub-hosted runners with read-only permissions and no secrets, so a
+# pull request from a fork is harmless.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # actionlint is what checks the parts of a workflow nothing else can: expression
+      # syntax, contexts used where they do not exist, and references to step outputs
+      # that no step produces. It also runs shellcheck over `run:` blocks knowing the
+      # `env:` they are given, which standalone shellcheck cannot.
+      - name: Install actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o actionlint.tar.gz "$url"
+          echo "${SHA256}  actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          rm -f actionlint actionlint.tar.gz
+          actionlint --version
+
+      - name: actionlint
+        run: actionlint -color
+
+      # Standalone shellcheck for the scripts themselves, which actionlint does not see.
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          shellcheck -S style clang-tidy/*.sh tests/*.sh
+
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      # Exercises clang_tidy.sh against a synthetic repository and stub analyzers,
+      # including the branches that only appear when the analyzer crashes or is the
+      # wrong version — the ones that keep a broken analysis from reporting green.
+      - name: Script tests
+        run: bash tests/test_clang_tidy_sh.sh
