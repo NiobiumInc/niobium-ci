@@ -119,7 +119,7 @@ jobs:
           # runner that clones those through an authenticated https rewrite has no ssh
           # key to offer. No token is involved: the shared repository is public, so
           # plain https is enough and this step stays secret-free.
-          git -c url."https://github.com/".insteadOf="git@github.com:" \
+          git -c "url.https://github.com/.insteadOf=git@github.com:" \
               submodule update --init -- "$SHARED_PATH"
           echo "shared CI at $SHARED_PATH is $(git -C "$SHARED_PATH" rev-parse --short HEAD)"
 
@@ -208,7 +208,7 @@ jobs:
               fi
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-          exit $rc
+          exit "$rc"
 
       - name: Upload report
         if: always()
