@@ -251,6 +251,16 @@ jobs:
           eval "$ANALYZE_COMMAND"
           rc=$?
           set -e
+
+          # Prefer the status the analysis published over the one the shell saw. A
+          # consumer reaches the analysis through its own command, and an intermediary
+          # need not preserve an exit code -- `make`, for one, answers 2 for any failed
+          # recipe, which would make findings indistinguishable from an analysis that
+          # produced no verdict and could not be downgraded.
+          if [ -f clang-tidy-status.txt ]; then
+            rc=$(cat clang-tidy-status.txt)
+          fi
+
           count=$(python3 "$REPORT_SCRIPT" count -i clang-tidy-report.txt 2>/dev/null || echo 0)
           echo "count=$count" >> "$GITHUB_OUTPUT"
           python3 "$REPORT_SCRIPT" annotations -i clang-tidy-report.txt || true

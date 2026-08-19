@@ -31,6 +31,7 @@ HELPERS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CLANG_TIDY_COMMITTED:=0}"
 CLANG_TIDY_BASE="${CLANG_TIDY_BASE:-}"
 DB="$CLANG_TIDY_BUILD_DIR/compile_commands.json"
+STATUS_FILE="clang-tidy-status.txt"
 
 # GitHub renders ::error:: as an annotation; elsewhere it is just a prefix, so the
 # same message reads correctly in a terminal.
@@ -152,14 +153,6 @@ toolchain_args() {
     dir=$(dirname "$(gcc -print-libgcc-file-name 2>/dev/null)" 2>/dev/null || true)
     [ -n "$inc" ] && printf '%s\n' "-idirafter$inc"
     [ -n "$dir" ] && printf '%s\n' "--gcc-install-dir=$dir"
-}
-
-# A crash is not a finding: the unit was never analyzed, so the result says
-# nothing about the code. Exit status >= 128 is death by signal; the signature
-# catches builds that print the dump and exit without one.
-crashed() {
-    local rc="$1" file="$2"
-    [ "$rc" -ge 128 ] || grep -qE 'PLEASE submit a bug report|Stack dump:' "$file"
 }
 
 lint_diff() {
@@ -322,13 +315,30 @@ SH
     rm -rf "$outdir"
 }
 
-case "$MODE" in
-    check-tool) check_tool || exit "$EX_NOVERDICT" ;;
-    # The pre-flight checks mean the analysis did not run, so they exit 2 rather than
-    # falling through as if the code were clean.
-    diff)       check_tool && check_scope && check_compile_db || exit "$EX_NOVERDICT"
-                lint_diff ;;
-    all)        check_tool && check_scope && check_compile_db || exit "$EX_NOVERDICT"
-                lint_all ;;
-    *)          err "unknown mode: $MODE"; exit "$EX_NOVERDICT" ;;
-esac
+run_mode() {
+    case "$MODE" in
+        check-tool) check_tool || return "$EX_NOVERDICT" ;;
+        # The pre-flight checks mean the analysis did not run, so they report 2 rather
+        # than falling through as if the code were clean.
+        diff)       check_tool && check_scope && check_compile_db || return "$EX_NOVERDICT"
+                    lint_diff ;;
+        all)        check_tool && check_scope && check_compile_db || return "$EX_NOVERDICT"
+                    lint_all ;;
+        *)          err "unknown mode: $MODE"; return "$EX_NOVERDICT" ;;
+    esac
+}
+
+# Removed first, so a status left by an earlier run cannot be read as this one's.
+rm -f "$STATUS_FILE"
+run_mode
+rc=$?
+
+# --------------------------------------------------------------------------
+# The contract above is worth nothing to a caller that reaches this through `make`:
+# GNU make answers 2 for any failed recipe and does not propagate the recipe's own
+# status, so findings and a broken analysis arrive identical. Publishing the status
+# where it survives the wrapper is what lets a caller be lenient about one and not the
+# other. A caller invoking this directly can keep using $?.
+# --------------------------------------------------------------------------
+printf '%s\n' "$rc" > "$STATUS_FILE"
+exit "$rc"

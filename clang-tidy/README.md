@@ -195,8 +195,8 @@ Every other input has a working default; see the two workflow files for the full
 ### Files the analysis writes
 
 Into the repository root, on each run: `clang-tidy-report.txt`, `clang-tidy-stderr.txt`
-(diff mode), `clang-tidy-full.txt`, `clang-tidy-unscoped.txt` and, only when something
-crashed, `clang-tidy-crashes.txt`. Add them to the consumer's `.gitignore` — CI
+(diff mode), `clang-tidy-full.txt`, `clang-tidy-unscoped.txt`, `clang-tidy-status.txt`
+and, only when something crashed, `clang-tidy-crashes.txt`. Add them to the consumer's `.gitignore` — CI
 workspaces are disposable, but a developer's is not.
 
 ## Keeping the pin current

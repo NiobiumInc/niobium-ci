@@ -122,6 +122,34 @@ expect_rc 2 "diff: no diff base exits 2" \
 expect_rc 2 "diff: no diff driver exits 2" \
     env CLANG_TIDY_DIFF=/absent.py bash "$SUT" diff
 
+# --- the published status --------------------------------------------------
+# An intermediary need not preserve an exit code -- `make` answers 2 for any failed
+# recipe -- so the status is published where a caller can read it back.
+setup; fake_driver; change_a_compiled_source
+export CLANG_TIDY_BIN="$REPO/bin/ct-find"
+bash "$SUT" diff >/dev/null 2>&1
+if [ "$(cat clang-tidy-status.txt 2>/dev/null)" = "1" ]; then
+    ok "diff: findings publish status 1 to clang-tidy-status.txt"
+else
+    no "diff: findings publish status 1 to clang-tidy-status.txt" "got '$(cat clang-tidy-status.txt 2>/dev/null)'"
+fi
+
+export CLANG_TIDY_BIN="$REPO/bin/ct-crash"
+bash "$SUT" diff >/dev/null 2>&1
+if [ "$(cat clang-tidy-status.txt 2>/dev/null)" = "2" ]; then
+    ok "diff: a crash publishes status 2, which a caller must not downgrade"
+else
+    no "diff: a crash publishes status 2" "got '$(cat clang-tidy-status.txt 2>/dev/null)'"
+fi
+
+export CLANG_TIDY_BIN="$REPO/bin/ct-clean"
+bash "$SUT" diff >/dev/null 2>&1
+if [ "$(cat clang-tidy-status.txt 2>/dev/null)" = "0" ]; then
+    ok "diff: a clean run replaces the previous status rather than leaving it"
+else
+    no "diff: a clean run replaces the previous status" "got '$(cat clang-tidy-status.txt 2>/dev/null)'"
+fi
+
 # --- selection -------------------------------------------------------------
 setup; fake_driver
 CLANG_TIDY_BASE="$(git rev-parse HEAD)"; export CLANG_TIDY_BASE

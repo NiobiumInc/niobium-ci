@@ -170,6 +170,12 @@ jobs:
           rc=$?
           set -e
 
+          # See the note in clang-tidy-diff.yml: an intermediary need not preserve an
+          # exit code, so prefer the status the analysis published.
+          if [ -f clang-tidy-status.txt ]; then
+            rc=$(cat clang-tidy-status.txt)
+          fi
+
           count=$(python3 "$REPORT_SCRIPT" count -i clang-tidy-full.txt 2>/dev/null || echo 0)
           unscoped=$(wc -l < clang-tidy-unscoped.txt 2>/dev/null | tr -d ' ' || echo 0)
           {
