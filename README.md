@@ -1,62 +1,78 @@
 # niobium-ci
 
-Reusable CI workflows and composite actions shared across Niobium repositories,
-so consumers avoid duplicating CI logic.
+Shared CI for Niobium repositories, so consumers stop duplicating CI logic.
 
 ## How it works
 
-Each capability is a reusable workflow (a secret-touching wrapper that checks out,
-authenticates, and runs the consumer-provided task command) plus a secret-free
-composite action (the core logic). A consumer invokes it with a small caller
-workflow that supplies inputs and, when needed, a secret. Secrets stay in the
-consumer repository and are passed at call time — never stored here. The caller
-pins the reference to a commit SHA or an immutable tag — never a moving branch —
-so a change here cannot alter its CI until the pin is deliberately bumped.
+Two kinds of thing live here, consumed two different ways.
+
+**Reusable workflows** are referenced remotely with `uses:` at a pinned ref. They own
+what a local run has no equivalent for: checkout and authentication, a pull request's
+diff base, skipping an expensive build when nothing relevant changed, and rendering
+results into GitHub. They are the only place a consumer's secret is touched, and they
+reference nothing in this repository by tag — so a consumer pinning by SHA gets a pin
+that cannot move.
+
+**The analysis scripts** are checked out by the consumer as a **submodule**, pinned by
+commit SHA. A local `make clang-tidy` and the gate execute the same file at the same
+pinned commit, so they cannot reach different verdicts.
+
+Configuration is not shared. `.clang-tidy`, the scope of product code, and the analyzer
+version belong to each repository. What is shared is the runner, not the policy.
 
 ```mermaid
 flowchart TD
-  subgraph shared["NiobiumInc/niobium-ci — public, pinned @vN"]
-    RW["reusable workflow (workflow_call)<br/>secret-touching: checkout, auth, run task"]
-    CA["composite action(s)<br/>secret-free core logic + scripts"]
-    RW --> CA
+  subgraph shared["NiobiumInc/niobium-ci — public, zero secrets"]
+    RW["reusable workflows (workflow_call)<br/>checkout · auth · diff base · rendering"]
+    SC["clang-tidy/<br/>analysis + analyzer install"]
   end
-  subgraph repoA["consumer repo A (private)"]
-    A["caller workflow<br/>inputs: task cmd + params<br/>secret: token"]
+  subgraph consumer["consumer repository"]
+    CW["caller workflow<br/>inputs + secret"]
+    MK["Makefile<br/>make clang-tidy"]
+    SM[".niobium-ci/<br/>submodule, pinned by SHA"]
+    CFG[".clang-tidy · scope · version"]
   end
-  subgraph repoB["consumer repo B (public)"]
-    B["caller workflow<br/>inputs only (no secret)"]
-  end
-  A -- "uses @vN, with inputs + secret" --> RW
-  B -- "uses @vN, with inputs" --> RW
+  DEV["developer"] --> MK
+  CW -- "uses @pin, with inputs + secret" --> RW
+  RW -- "runs the same make target" --> MK
+  MK --> SM
+  MK -.- CFG
+  SC -. "one implementation" .- SM
 ```
 
-A single run flows from the caller through the reusable workflow to the composite
-action:
+A gate run flows from the caller through the reusable workflow, which prepares the
+workspace and then delegates the analysis to the consumer's own target:
 
 ```mermaid
 sequenceDiagram
-  participant Dev as push / PR
-  participant Caller as caller workflow<br/>(consumer repo)
-  participant RW as reusable workflow<br/>(niobium-ci @vN)
-  participant CA as composite action<br/>(niobium-ci, secret-free)
+  participant Dev as pull request
+  participant Caller as caller workflow<br/>(consumer)
+  participant RW as reusable workflow<br/>(niobium-ci @pin)
+  participant Repo as consumer workspace
   Dev->>Caller: trigger
-  Caller->>RW: uses @vN (inputs + secrets)
-  RW->>RW: checkout + auth (secret-touching)
-  RW->>RW: run consumer-provided task command
-  RW->>CA: delegate core logic over the prepared workspace
-  CA->>CA: do the work, produce report / annotations
-  CA-->>RW: result
+  Caller->>RW: uses @pin (inputs + secrets)
+  RW->>Repo: checkout, init the shared submodule
+  RW->>RW: resolve diff base; skip if nothing in scope changed
+  RW->>Repo: run build-command (the only step holding a secret)
+  RW->>Repo: run make clang-tidy — the developer's command
+  Repo-->>RW: report
+  RW->>RW: annotations, job summary, artifact
   RW-->>Caller: pass / fail
 ```
 
 ## Capabilities
 
-Each capability is documented here as its workflow is added. _None yet._
+- **clang-tidy** — diff-only gate and whole-repository survey. See
+  [`clang-tidy/README.md`](clang-tidy/README.md) for the submodule, Makefile and caller
+  workflows a consumer needs.
 
 ## Security
 
-Secrets never live in this repository; consumers pass them at call time. See
-`SECURITY.md`.
+Secrets never live in this repository. Consumers pass them at call time to a reusable
+workflow, which exposes them to the single step that needs them; the analysis scripts
+are secret-free and read no token. Pin every reference — a commit SHA or an immutable
+tag, never a moving branch — so a change here cannot alter a consumer's CI until the pin
+is deliberately bumped. See `SECURITY.md`.
 
 ## License
 
