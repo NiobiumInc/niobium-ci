@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Whole-repository clang-tidy survey. Informational: findings are debt and do not
+# Analyzes every in-scope translation unit. Informational: findings are debt and do not
 # fail the job, so the number tracks static-analysis debt and its trend.
 #
-# As with the gate, the analysis runs through the consumer's own `make
+# Named after what it analyzes, not after a cadence: a consumer decides whether this runs
+# nightly, weekly or on demand.
+#
+# As with `diff`, the analysis runs through the consumer's own `make
 # clang-tidy-all` over the submodule's script — same command, same bytes, same scope.
 # That is what makes this number mean "the debt in the code the gate protects"
 # rather than the debt in some adjacent set of files.
@@ -11,7 +14,7 @@
 # Two things do fail it, because both make the total a lie: a crashed translation
 # unit was never analyzed, and a survey that silently skips units reports a
 # shrinking debt as the toolchain gets worse.
-name: clang-tidy nightly (reusable)
+name: clang-tidy all (reusable)
 
 on:
   workflow_call:
@@ -99,7 +102,7 @@ jobs:
         with:
           token: ${{ secrets.token || github.token }}
 
-      # See the note in clang-tidy-gate.yml: only this submodule, and it is public.
+      # See the note in clang-tidy-diff.yml: only this submodule, and it is public.
       - name: Initialize shared CI submodule
         if: inputs.shared-path != ''
         env:
@@ -111,7 +114,13 @@ jobs:
             echo "::error::$SHARED_PATH is not a submodule of this repository — add it, or set shared-path to '' if the scripts arrive another way"
             exit 1
           fi
-          git submodule update --init -- "$SHARED_PATH"
+          # Rewrite an ssh URL to https for this command only. A consumer whose other
+          # submodules are private will have declared this one the same way, and a
+          # runner that clones those through an authenticated https rewrite has no ssh
+          # key to offer. No token is involved: the shared repository is public, so
+          # plain https is enough and this step stays secret-free.
+          git -c url."https://github.com/".insteadOf="git@github.com:" \
+              submodule update --init -- "$SHARED_PATH"
           echo "shared CI at $SHARED_PATH is $(git -C "$SHARED_PATH" rev-parse --short HEAD)"
 
       - name: Resolve analyzer version

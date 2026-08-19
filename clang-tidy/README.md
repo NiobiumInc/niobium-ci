@@ -130,7 +130,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   clang-tidy:
-    uses: NiobiumInc/niobium-ci/.github/workflows/clang-tidy-gate.yml@<commit-sha>
+    uses: NiobiumInc/niobium-ci/.github/workflows/clang-tidy-diff.yml@<commit-sha>
     with:
       runs-on: '["self-hosted","your-runner-label"]'
       build-command: bash .github/scripts/build-compile-db.sh
@@ -139,14 +139,14 @@ jobs:
 ```
 
 ```yaml
-# .github/workflows/nightly-clang-tidy.yml
+# .github/workflows/nightly-clang-tidy.yml -- the cadence is the consumer's choice
 name: Nightly - clang-tidy whole-repo survey
 on:
   schedule: [{ cron: '0 7 * * *' }]
   workflow_dispatch:
 jobs:
   survey:
-    uses: NiobiumInc/niobium-ci/.github/workflows/clang-tidy-nightly.yml@<commit-sha>
+    uses: NiobiumInc/niobium-ci/.github/workflows/clang-tidy-all.yml@<commit-sha>
     with:
       runs-on: '["self-hosted","your-runner-label"]'
       build-command: bash .github/scripts/build-compile-db.sh
@@ -159,6 +159,10 @@ analyzer install comes from the submodule, and the only remote actions they use 
 third-party ones already pinned by SHA — so a SHA pin here is immutable end to end, and
 no release or tag is required. Dependabot's `github-actions` ecosystem keeps it current
 and annotates the bump with the version.
+
+The two workflows are named after what they analyze — the changed lines, or everything
+in scope — matching the modes of `clang_tidy.sh`. Whether findings block, and how often
+the whole-repository pass runs, are the consumer's choices and do not appear in a name.
 
 A reusable workflow cannot schedule itself — `on: schedule` and `on: workflow_call` are
 different triggers — so the nightly needs this small caller even though no person

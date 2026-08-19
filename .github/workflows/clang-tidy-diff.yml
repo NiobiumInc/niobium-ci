@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# Diff-only clang-tidy gate: fails on findings introduced by the changed lines, not
-# on pre-existing debt in the files a pull request happens to touch.
+# Analyzes the lines a pull request changed, and nothing else: findings on untouched
+# lines of a touched file are not this change's to answer for. Whether findings block is
+# the caller's choice, not this workflow's identity.
 #
 # The analysis itself is NOT performed here. It runs through the consumer's own
 # `make clang-tidy`, which drives clang_tidy.sh from this repository checked out as a
@@ -15,7 +16,10 @@
 #
 # It always reports a status, short-circuiting to success when nothing in scope
 # changed, so it is safe to register as a required check.
-name: clang-tidy gate (reusable)
+#
+# Named after what it analyzes rather than after a policy: `all` is its counterpart, and
+# both match the modes of the script that does the work.
+name: clang-tidy diff (reusable)
 
 on:
   workflow_call:
@@ -131,7 +135,13 @@ jobs:
             echo "::error::$SHARED_PATH is not a submodule of this repository — add it, or set shared-path to '' if the scripts arrive another way"
             exit 1
           fi
-          git submodule update --init -- "$SHARED_PATH"
+          # Rewrite an ssh URL to https for this command only. A consumer whose other
+          # submodules are private will have declared this one the same way, and a
+          # runner that clones those through an authenticated https rewrite has no ssh
+          # key to offer. No token is involved: the shared repository is public, so
+          # plain https is enough and this step stays secret-free.
+          git -c url."https://github.com/".insteadOf="git@github.com:" \
+              submodule update --init -- "$SHARED_PATH"
           echo "shared CI at $SHARED_PATH is $(git -C "$SHARED_PATH" rev-parse --short HEAD)"
 
       - name: Resolve analyzer version
