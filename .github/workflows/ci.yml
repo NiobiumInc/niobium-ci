@@ -3,8 +3,9 @@
 # This repository's own CI. What ships from here runs in other repositories'
 # pipelines, so a mistake reaches further than it would in any single project.
 #
-# It runs on GitHub-hosted runners with read-only permissions and no secrets, so a
-# pull request from a fork is harmless.
+# This workflow -- not the ones published from here -- runs on GitHub-hosted runners,
+# with read-only permissions and no secrets, so a pull request from a fork is harmless.
+# Where a published workflow runs is its consumer's choice, through its runs-on input.
 name: CI
 
 on:
