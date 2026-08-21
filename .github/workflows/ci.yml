@@ -1,17 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 #
-# This repository's own CI. What ships from here runs in every consumer's pipeline
-# and on every developer's machine, so a regression escapes to more places than a
-# change to any single project would.
+# This repository's own CI. What ships from here runs in other repositories'
+# pipelines, so a mistake reaches further than it would in any single project.
 #
-# It runs on GitHub-hosted runners with read-only permissions and no secrets, so a
-# pull request from a fork is harmless.
+# This workflow -- not the ones published from here -- runs on GitHub-hosted runners,
+# with read-only permissions and no secrets, so a pull request from a fork is harmless.
+# Where a published workflow runs is its consumer's choice, through its runs-on input.
 name: CI
 
 on:
   pull_request:
-  push:
-    branches: [main]
 
 permissions:
   contents: read
@@ -65,7 +63,7 @@ jobs:
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
       # Exercises clang_tidy.sh against a synthetic repository and stub analyzers,
-      # including the branches that only appear when the analyzer crashes or is the
-      # wrong version — the ones that keep a broken analysis from reporting green.
+      # including the branches that appear only when the analyzer crashes or is the
+      # wrong version -- the ones that keep a broken analysis from reporting green.
       - name: Script tests
         run: bash tests/test_clang_tidy_sh.sh
