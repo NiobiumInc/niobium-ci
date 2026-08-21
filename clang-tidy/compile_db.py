@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Intersect a list of candidate paths with the translation units in a compile database.
+"""Keep only the paths the build actually compiles.
 
-Reads repository-relative candidate paths on stdin and prints those that appear as
-entries in `compile_commands.json`, repo-relative and sorted.
+Reads candidate paths on stdin and prints those that appear in the build's
+`compile_commands.json`, repo-relative and sorted.
 
-This is what lets `scope` stay a statement of policy rather than a list of tool
-workarounds: product code that carries no compile command — not built yet, headers,
-generated-but-unbuilt sources — drops out here instead of being hand-excluded from
-the pathspec, and returns to coverage on its own once the build compiles it.
+clang-tidy replays the compiler flags the build recorded, so a file with no entry in
+that database cannot be analysed at all — asking anyway yields an error rather than a
+finding. Without this filter that has to be handled by hand, by excluding such files
+from the pathspec that selects what to analyse. That mixes two questions which are
+better kept apart — "is this our product code?" and "can it be analysed today?" — and
+the exclusion goes stale, silently, the day the build starts compiling that directory.
+
+Filtering here leaves the pathspec answering only the first question, and answers the
+second on every run.
 """
 import argparse
 import json
