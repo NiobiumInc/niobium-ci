@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# This repository's own CI. What ships from here runs in other repositories'
+# pipelines, so a mistake reaches further than it would in any single project.
+#
+# It runs on GitHub-hosted runners with read-only permissions and no secrets, so a
+# pull request from a fork is harmless.
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      # actionlint is what checks the parts of a workflow nothing else can: expression
+      # syntax, contexts used where they do not exist, and references to step outputs
+      # that no step produces. It also runs shellcheck over `run:` blocks knowing the
+      # `env:` they are given, which standalone shellcheck cannot.
+      - name: Install actionlint
+        env:
+          VERSION: 1.7.12
+          SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          url="https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o actionlint.tar.gz "$url"
+          echo "${SHA256}  actionlint.tar.gz" | sha256sum --check --strict
+          tar -xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          rm -f actionlint actionlint.tar.gz
+          actionlint --version
+
+      - name: actionlint
+        run: actionlint -color

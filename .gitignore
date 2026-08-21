@@ -1,0 +1,15 @@
+# Byte-compiled output from the actions' Python scripts. Running or testing them
+# locally produces this next to the sources; it must never ship inside an action,
+# since consumers execute whatever the action directory contains.
+__pycache__/
+*.py[cod]
+
+# Test tooling for the repository's own CI (script tests, coverage).
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor and OS noise, worth ignoring in a public repository that takes outside
+# contributions.
+.DS_Store
+*.swp
