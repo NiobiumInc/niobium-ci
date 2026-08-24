@@ -45,3 +45,25 @@ jobs:
 
       - name: actionlint
         run: actionlint -color
+
+      # Standalone shellcheck for the scripts themselves, which actionlint does not see.
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          shellcheck -S style clang-tidy/*.sh tests/*.sh
+
+  tests:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Python unit tests
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      # Exercises clang_tidy.sh against a synthetic repository and stub analyzers,
+      # including the branches that appear only when the analyzer crashes or is the
+      # wrong version -- the ones that keep a broken analysis from reporting green.
+      - name: Script tests
+        run: bash tests/test_clang_tidy_sh.sh

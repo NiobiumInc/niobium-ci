@@ -1,0 +1,223 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Analyzes every in-scope translation unit. Informational: findings are debt and do not
+# fail the job, so the number tracks static-analysis debt and its trend.
+#
+# Named after what it analyzes, not after a cadence: a consumer decides whether this runs
+# nightly, weekly or on demand.
+#
+# As with `diff`, the analysis runs through the consumer's own `make
+# clang-tidy-all` over the submodule's script — same command, same bytes, same scope.
+# That is what makes this number mean "the debt in the code the gate protects"
+# rather than the debt in some adjacent set of files.
+#
+# Two things do fail it, because both make the total a lie: a crashed translation
+# unit was never analyzed, and a survey that silently skips units reports a
+# shrinking debt as the toolchain gets worse.
+name: clang-tidy all (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: >
+          Shell command producing compile_commands.json. Anything the build needs —
+          submodule fetching included — belongs here, where internal details stay
+          private. The token, when passed, is available to it as $GH_TOKEN.
+        required: true
+        type: string
+      analyze-command:
+        description: 'Command running the whole-repository survey.'
+        required: false
+        type: string
+        default: 'make clang-tidy-all'
+      version-command:
+        description: 'Command printing the exact clang-tidy version this project expects.'
+        required: false
+        type: string
+        default: 'make -s print-clang-tidy-version'
+      report-script:
+        description: >
+          clang_tidy_report.py, used to render the result. Defaults to the copy inside
+          the submodule; keep it consistent with shared-path.
+        required: false
+        type: string
+        default: '.niobium-ci/clang-tidy/clang_tidy_report.py'
+      shared-path:
+        description: >
+          Path where this repository is mounted as a submodule in the caller. It is
+          initialised before anything else runs, since the analysis lives there. Set to
+          an empty string if the scripts reach the workspace some other way.
+        required: false
+        type: string
+        default: '.niobium-ci'
+      runs-on:
+        description: >
+          Runner label, or a JSON array of labels. Worth pinning to one runner
+          family: clang-tidy reads the host's GCC for its include paths, so surveys
+          are comparable across runs on one family rather than across all of them.
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+      top:
+        description: 'Maximum rows in the summary findings table.'
+        required: false
+        type: number
+        default: 200
+      timeout-minutes:
+        required: false
+        type: number
+        default: 180
+      artifact-retention-days:
+        required: false
+        type: number
+        default: 14
+    secrets:
+      token:
+        required: false
+    outputs:
+      findings-count:
+        description: 'Findings across all analyzed translation units.'
+        value: ${{ jobs.clang-tidy.outputs.findings-count }}
+      unscoped-count:
+        description: >
+          Tracked translation units the build compiles and the scope excludes.
+          Expected to be non-zero; it is how an over-broad exclusion becomes visible.
+        value: ${{ jobs.clang-tidy.outputs.unscoped-count }}
+
+permissions:
+  contents: read
+
+jobs:
+  clang-tidy:
+    name: clang-tidy (whole repo)
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      findings-count: ${{ steps.render.outputs.count }}
+      unscoped-count: ${{ steps.render.outputs.unscoped }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          token: ${{ secrets.token || github.token }}
+
+      # See the note in clang-tidy-diff.yml: only this submodule, and it is public.
+      - name: Initialize shared CI submodule
+        if: inputs.shared-path != ''
+        env:
+          SHARED_PATH: ${{ inputs.shared-path }}
+        run: |
+          set -euo pipefail
+          if ! git config --file .gitmodules --get-regexp '^submodule\..*\.path$' \
+               | awk '{print $2}' | grep -qx "$SHARED_PATH"; then
+            echo "::error::$SHARED_PATH is not a submodule of this repository — add it, or set shared-path to '' if the scripts arrive another way"
+            exit 1
+          fi
+          # Rewrite an ssh URL to https for this command only. A consumer whose other
+          # submodules are private will have declared this one the same way, and a
+          # runner that clones those through an authenticated https rewrite has no ssh
+          # key to offer. No token is involved: the shared repository is public, so
+          # plain https is enough and this step stays secret-free.
+          git -c "url.https://github.com/.insteadOf=git@github.com:" \
+              submodule update --init -- "$SHARED_PATH"
+          echo "shared CI at $SHARED_PATH is $(git -C "$SHARED_PATH" rev-parse --short HEAD)"
+
+      - name: Resolve analyzer version
+        id: version
+        env:
+          VERSION_COMMAND: ${{ inputs.version-command }}
+        run: |
+          set -euo pipefail
+          version="$(eval "$VERSION_COMMAND" | tr -d '[:space:]')"
+          if [ -z "$version" ]; then
+            echo "::error::version-command produced nothing"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Setup clang-tidy
+        id: tool
+        env:
+          SHARED_PATH: ${{ inputs.shared-path }}
+          CLANG_TIDY_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # From the submodule, so the only remote references this workflow carries
+          # are third-party actions pinned by SHA. Nothing points back at niobium-ci
+          # by tag, so a consumer's SHA pin is genuinely immutable.
+          bin="$(bash "$SHARED_PATH/clang-tidy/setup_clang_tidy.sh")"
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Build compile database
+        env:
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          GH_TOKEN: ${{ secrets.token }}
+        run: |
+          set -euo pipefail
+          eval "$BUILD_COMMAND"
+
+      - name: Survey and render
+        id: render
+        env:
+          ANALYZE_COMMAND: ${{ inputs.analyze-command }}
+          REPORT_SCRIPT: ${{ inputs.report-script }}
+          TOP: ${{ inputs.top }}
+          CLANG_TIDY_BIN: ${{ steps.tool.outputs.path }}
+        run: |
+          set -uo pipefail
+          set +e
+          eval "$ANALYZE_COMMAND"
+          rc=$?
+          set -e
+
+          # See the note in clang-tidy-diff.yml: an intermediary need not preserve an
+          # exit code, so prefer the status the analysis published.
+          if [ -f clang-tidy-status.txt ]; then
+            rc=$(cat clang-tidy-status.txt)
+          fi
+
+          count=$(python3 "$REPORT_SCRIPT" count -i clang-tidy-full.txt 2>/dev/null || echo 0)
+          unscoped=$(wc -l < clang-tidy-unscoped.txt 2>/dev/null | tr -d ' ' || echo 0)
+          {
+            echo "count=$count"
+            echo "unscoped=${unscoped:-0}"
+          } >> "$GITHUB_OUTPUT"
+
+          python3 "$REPORT_SCRIPT" summary -i clang-tidy-full.txt \
+            --top "$TOP" >> "$GITHUB_STEP_SUMMARY" || true
+
+          # A crash means the unit was never analyzed, so the totals above understate
+          # the debt. Say so next to them rather than in the log alone.
+          if [ -s clang-tidy-crashes.txt ]; then
+            {
+              printf '\n## clang-tidy crashed\n\n'
+              printf 'The units below were not analyzed, so the totals understate the debt.\n\n'
+              sed 's/^/- /' clang-tidy-crashes.txt
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # What the scope leaves out, among code tracked here and compiled by the build.
+          if [ "${unscoped:-0}" -gt 0 ]; then
+            {
+              printf '\n## Compiled but not analyzed (%s)\n\n' "$unscoped"
+              printf 'Tracked translation units the build compiles and the scope excludes.\n'
+              printf 'Confirm these are still meant to be skipped.\n\n'
+              head -n 10 clang-tidy-unscoped.txt | sed 's/^/- /'
+              if [ "$unscoped" -gt 10 ]; then
+                printf -- '- …and %s more\n' "$((unscoped - 10))"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: clang-tidy-full-${{ github.run_attempt }}
+          path: |
+            clang-tidy-full.txt
+            clang-tidy-crashes.txt
+            clang-tidy-unscoped.txt
+          if-no-files-found: ignore
+          retention-days: ${{ inputs.artifact-retention-days }}

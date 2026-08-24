@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Analyzes the lines a pull request changed, and nothing else: findings on untouched
+# lines of a touched file are not this change's to answer for. Whether findings block is
+# the caller's choice, not this workflow's identity.
+#
+# The analysis itself is NOT performed here. It runs through the consumer's own
+# `make clang-tidy`, which drives clang_tidy.sh from this repository checked out as a
+# submodule — the same command, and the same bytes, a developer runs locally. A gate
+# that analyzed the code its own way could disagree with what the developer already
+# saw, which is what pinning one shared implementation exists to prevent.
+#
+# What this workflow owns is everything a local run has no equivalent for: the
+# credential-touching steps, the pull request's diff base, skipping an expensive
+# build when nothing in scope changed, and rendering the result into GitHub.
+#
+# It always reports a status, short-circuiting to success when nothing in scope
+# changed, so it is safe to register as a required check.
+#
+# Named after what it analyzes rather than after a policy: `all` is its counterpart, and
+# both match the modes of the script that does the work.
+name: clang-tidy diff (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      build-command:
+        description: >
+          Shell command producing compile_commands.json. Anything the build needs —
+          submodule fetching included — belongs here, in the caller's repository,
+          where internal details stay private. The token, when passed, is available
+          to it as $GH_TOKEN.
+        required: true
+        type: string
+      analyze-command:
+        description: 'Command running the diff analysis. Receives CLANG_TIDY_* in its environment.'
+        required: false
+        type: string
+        default: 'make clang-tidy'
+      version-command:
+        description: 'Command printing the exact clang-tidy version this project expects.'
+        required: false
+        type: string
+        default: 'make -s print-clang-tidy-version'
+      scope-command:
+        description: >
+          Command printing the git pathspec of product code. Used only to decide
+          whether anything in scope changed, so an out-of-scope pull request can skip
+          the build entirely; the analysis reads the scope itself.
+        required: false
+        type: string
+        default: 'make -s print-clang-tidy-scope'
+      report-script:
+        description: >
+          clang_tidy_report.py, used to render the result. Defaults to the copy inside
+          the submodule; keep it consistent with shared-path.
+        required: false
+        type: string
+        default: '.niobium-ci/clang-tidy/clang_tidy_report.py'
+      shared-path:
+        description: >
+          Path where this repository is mounted as a submodule in the caller. It is
+          initialised before anything else runs, since the analysis lives there. Set to
+          an empty string if the scripts reach the workspace some other way.
+        required: false
+        type: string
+        default: '.niobium-ci'
+      fail-on-findings:
+        description: >
+          Whether findings on changed lines block the pull request. Set to false to
+          report them without failing: they still appear as inline annotations on the
+          affected lines and in the job summary. A crashed or misconfigured analysis
+          fails either way — leniency applies to findings, never to a missing verdict.
+        required: false
+        type: boolean
+        default: true
+      base-ref:
+        description: 'Branch to diff against for non-pull-request events.'
+        required: false
+        type: string
+        default: 'main'
+      runs-on:
+        description: 'Runner label, or a JSON array of labels.'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+      timeout-minutes:
+        required: false
+        type: number
+        default: 60
+      artifact-retention-days:
+        required: false
+        type: number
+        default: 7
+    secrets:
+      token:
+        description: >
+          Only needed by repositories whose build must clone private repositories of
+          the organization. Everything else falls back to the automatic GITHUB_TOKEN.
+        required: false
+    outputs:
+      findings-count:
+        description: 'Findings on changed lines. Empty when nothing in scope changed.'
+        value: ${{ jobs.clang-tidy.outputs.findings-count }}
+
+permissions:
+  contents: read
+
+jobs:
+  clang-tidy:
+    name: clang-tidy (changed lines)
+    runs-on: ${{ startsWith(inputs.runs-on, '[') && fromJSON(inputs.runs-on) || inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    outputs:
+      findings-count: ${{ steps.render.outputs.count }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Full history so the diff base is present locally.
+          fetch-depth: 0
+          token: ${{ secrets.token || github.token }}
+
+      # The analysis lives in this submodule, so bring it in before anything needs it.
+      # Only this one path: the caller's other submodules are the build's business and
+      # belong to build-command, which may need a token for them. This one is public.
+      - name: Initialize shared CI submodule
+        if: inputs.shared-path != ''
+        env:
+          SHARED_PATH: ${{ inputs.shared-path }}
+        run: |
+          set -euo pipefail
+          if ! git config --file .gitmodules --get-regexp '^submodule\..*\.path$' \
+               | awk '{print $2}' | grep -qx "$SHARED_PATH"; then
+            echo "::error::$SHARED_PATH is not a submodule of this repository — add it, or set shared-path to '' if the scripts arrive another way"
+            exit 1
+          fi
+          # Rewrite an ssh URL to https for this command only. A consumer whose other
+          # submodules are private will have declared this one the same way, and a
+          # runner that clones those through an authenticated https rewrite has no ssh
+          # key to offer. No token is involved: the shared repository is public, so
+          # plain https is enough and this step stays secret-free.
+          git -c "url.https://github.com/.insteadOf=git@github.com:" \
+              submodule update --init -- "$SHARED_PATH"
+          echo "shared CI at $SHARED_PATH is $(git -C "$SHARED_PATH" rev-parse --short HEAD)"
+
+      - name: Resolve analyzer version
+        id: version
+        env:
+          VERSION_COMMAND: ${{ inputs.version-command }}
+        run: |
+          set -euo pipefail
+          version="$(eval "$VERSION_COMMAND" | tr -d '[:space:]')"
+          if [ -z "$version" ]; then
+            echo "::error::version-command produced nothing"; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Setup clang-tidy
+        id: tool
+        env:
+          SHARED_PATH: ${{ inputs.shared-path }}
+          CLANG_TIDY_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # From the submodule, so the only remote references this workflow carries
+          # are third-party actions pinned by SHA. Nothing points back at niobium-ci
+          # by tag, so a consumer's SHA pin is genuinely immutable.
+          bin="$(bash "$SHARED_PATH/clang-tidy/setup_clang_tidy.sh")"
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+
+      - name: Determine diff base
+        id: base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ inputs.base-ref }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ] || [ "$EVENT_NAME" = "pull_request_target" ]; then
+            # checkout resolves refs/pull/N/merge, whose first parent is the base
+            # branch tip the pull request merges into, so diffing against it yields
+            # exactly this pull request's changes. pull_request.base.sha names the
+            # base as of the event and trails that tip whenever the base advances,
+            # which would attribute every commit merged since to this pull request.
+            # HEAD^2 confirms the merge commit; a checkout of the head ref instead
+            # falls back to the merge-base, which is correct there.
+            if git rev-parse --verify -q HEAD^2 >/dev/null; then
+              echo "sha=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+            else
+              echo "sha=$(git merge-base "$PR_BASE_SHA" HEAD)" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            git fetch --no-tags --quiet origin "$BASE_REF"
+            echo "sha=$(git merge-base "origin/$BASE_REF" HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect in-scope changes
+        id: changes
+        env:
+          SCOPE_COMMAND: ${{ inputs.scope-command }}
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          scope="$(eval "$SCOPE_COMMAND")"
+          if [ -z "${scope//[[:space:]]/}" ]; then
+            echo "::error::scope-command produced nothing"; exit 1
+          fi
+          # noglob: the ** and :(exclude) pathspec tokens must reach git literally.
+          set -f
+          # shellcheck disable=SC2086
+          if git diff --quiet "$BASE_SHA" -- $scope; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No in-scope source changed; skipping clang-tidy."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build compile database
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          # The caller's command arrives through the environment rather than being
+          # interpolated into this script, and the token is exposed only to this
+          # step — the one that legitimately needs it.
+          BUILD_COMMAND: ${{ inputs.build-command }}
+          GH_TOKEN: ${{ secrets.token }}
+        run: |
+          set -euo pipefail
+          eval "$BUILD_COMMAND"
+
+      - name: Analyze and render
+        id: render
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          ANALYZE_COMMAND: ${{ inputs.analyze-command }}
+          REPORT_SCRIPT: ${{ inputs.report-script }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          # Read by clang_tidy.sh. The Makefile assigns these with ?=, which defers
+          # to the environment, so a consumer needs no CI-specific make variables.
+          CLANG_TIDY_BASE: ${{ steps.base.outputs.sha }}
+          CLANG_TIDY_BIN: ${{ steps.tool.outputs.path }}
+          # The committed state is what a pull request is reviewed on; the working
+          # tree is a local convenience with no meaning here.
+          CLANG_TIDY_COMMITTED: '1'
+          FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+        run: |
+          set -uo pipefail
+          # Capture the verdict, render it, then exit with it: annotations and the
+          # summary are worth producing whether or not the check passed.
+          set +e
+          eval "$ANALYZE_COMMAND"
+          rc=$?
+          set -e
+
+          # Prefer the status the analysis published over the one the shell saw. A
+          # consumer reaches the analysis through its own command, and an intermediary
+          # need not preserve an exit code -- `make`, for one, answers 2 for any failed
+          # recipe, which would make findings indistinguishable from an analysis that
+          # produced no verdict and could not be downgraded.
+          if [ -f clang-tidy-status.txt ]; then
+            rc=$(cat clang-tidy-status.txt)
+          fi
+
+          count=$(python3 "$REPORT_SCRIPT" count -i clang-tidy-report.txt 2>/dev/null || echo 0)
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          python3 "$REPORT_SCRIPT" annotations -i clang-tidy-report.txt || true
+          python3 "$REPORT_SCRIPT" summary -i clang-tidy-report.txt \
+            --scope 'changed lines' --sha "$HEAD_SHA" >> "$GITHUB_STEP_SUMMARY" || true
+
+          # Status 1 means the analysis ran and reported findings — the only outcome a
+          # caller may downgrade. Anything else (a crash, the wrong analyzer, an empty
+          # scope, no compile database) means there is no verdict to be lenient about,
+          # and reporting green over it would be worse than having no gate.
+          if [ "$rc" -eq 1 ] && [ "$FAIL_ON_FINDINGS" != "true" ]; then
+            echo "::notice::clang-tidy reported $count finding(s) on changed lines; advisory only, not blocking this pull request."
+            {
+              printf '\n> **Advisory** — %s finding(s) on the changed lines did not block this pull request.\n' "$count"
+              printf '> They are shown inline on the affected lines under **Files changed**.\n'
+            } >> "$GITHUB_STEP_SUMMARY"
+            rc=0
+          fi
+          exit "$rc"
+
+      - name: Upload report
+        if: always() && steps.changes.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: clang-tidy-report-${{ github.run_attempt }}
+          path: |
+            clang-tidy-report.txt
+            clang-tidy-stderr.txt
+          if-no-files-found: ignore
+          retention-days: ${{ inputs.artifact-retention-days }}
