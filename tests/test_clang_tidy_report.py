@@ -45,6 +45,15 @@ class Parse(unittest.TestCase):
         line = diag(f"{ROOT}/include/h.h", 3, 7)
         self.assertEqual(len(self.parse([line, line, line])), 1)
 
+    def test_one_header_reached_through_different_paths_is_one_finding(self):
+        # The path is resolved from each translation unit's own directory, so a
+        # header included from several places arrives spelled several ways.
+        got = self.parse([diag(f"{ROOT}/replay/../include/h.h", 3, 7),
+                          diag(f"{ROOT}/formal/../include/h.h", 3, 7),
+                          diag(f"{ROOT}/include/h.h", 3, 7)])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["file"], f"{ROOT}/include/h.h")
+
     def test_same_line_different_check_is_two_findings(self):
         got = self.parse([diag(f"{ROOT}/src/a.cpp", 3, 7, check="a-one"),
                           diag(f"{ROOT}/src/a.cpp", 3, 7, check="b-two")])
@@ -57,6 +66,14 @@ class Parse(unittest.TestCase):
     def test_third_party_paths_are_dropped_by_default(self):
         got = self.parse([diag(f"{ROOT}/src/a.cpp"), diag(f"{ROOT}/vendor/lib/x.h"),
                           diag(f"{ROOT}/deps/y/z.cpp"), diag(f"{ROOT}/examples/e.cpp")])
+        self.assertEqual([f["file"] for f in got], [f"{ROOT}/src/a.cpp"])
+
+    def test_third_party_filter_looks_at_the_normalized_path(self):
+        # `src/../vendor/x.h` belongs to a vendored tree and `vendor/../src/a.cpp`
+        # does not; the regex reads the second one as third-party on the raw
+        # spelling and drops a file the repository owns.
+        got = self.parse([diag(f"{ROOT}/src/../vendor/x.h"),
+                          diag(f"{ROOT}/vendor/../src/a.cpp")])
         self.assertEqual([f["file"] for f in got], [f"{ROOT}/src/a.cpp"])
 
     def test_third_party_filter_is_configurable(self):

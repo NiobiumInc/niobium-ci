@@ -110,15 +110,16 @@ def parse(stream, third_party=DEFAULT_THIRD_PARTY):
     Matches the standard `path:line:col: warning|error: message [check]` lines
     and ignores everything else (note lines, source context, progress output).
     The synthetic `-warnings-as-errors` tag that WarningsAsErrors appends is
-    dropped, and the first remaining check name is used. Findings are
-    deduplicated by (file, line, col, check) because run-clang-tidy reports the
-    same header finding once per translation unit that includes it. Findings in
-    third-party and submodule trees are dropped: they belong to the projects that
-    own them.
+    dropped, and the first remaining check name is used. Paths are normalized
+    lexically, then findings are deduplicated by (file, line, col, check) because
+    run-clang-tidy reports the same header finding once per translation unit that
+    includes it. Findings in third-party and submodule trees are dropped: they
+    belong to the projects that own them.
 
     Args:
         stream: An iterable of text lines (an open file or sys.stdin).
-        third_party: Regex matched against the path; matches are discarded.
+        third_party: Regex matched against the normalized path; matches are
+            discarded.
 
     Yields:
         A dict per unique finding with keys: file, line, col, msg, check.
@@ -129,18 +130,28 @@ def parse(stream, third_party=DEFAULT_THIRD_PARTY):
         m = DIAG.match(raw.rstrip("\n"))
         if not m:
             continue
-        if third_party_re and third_party_re.search(m["file"]):
+        # clang-tidy prints the path as the compiler resolved it from the
+        # translation unit's own directory, so one header arrives spelled several
+        # ways: `driver/../include/x.h` and `include/x.h` are the same file.
+        # Collapse `..` before anything keys off the path. Unnormalized, the dedup
+        # below compares distinct strings and keeps every copy, the third-party
+        # regex matches a `..` segment that merely passes through such a directory,
+        # and `emit_annotations` prints a path GitHub cannot line up against the
+        # diff. Lexical rather than `realpath`: this parses text that may come from
+        # another machine, so it must not touch the filesystem.
+        path = os.path.normpath(m["file"])
+        if third_party_re and third_party_re.search(path):
             continue
         checks = [c for c in m["checks"].split(",") if c != "-warnings-as-errors"]
         if not checks:
             continue
         check = checks[0]
-        key = (m["file"], m["line"], m["col"], check)
+        key = (path, m["line"], m["col"], check)
         if key in seen:
             continue
         seen.add(key)
         yield {
-            "file": m["file"],
+            "file": path,
             "line": m["line"],
             "col": m["col"],
             "msg": m["msg"],
