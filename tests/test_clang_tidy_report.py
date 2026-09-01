@@ -86,6 +86,83 @@ class Parse(unittest.TestCase):
         self.assertEqual(len(got), 1)
 
 
+class Baseline(unittest.TestCase):
+    """The delta against an earlier run's diagnostics."""
+
+    def summary(self, lines, baseline_lines=None, label="run 1", **kw):
+        base = None if baseline_lines is None else list(ctr.parse(iter(baseline_lines)))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ctr.emit_summary(ctr.parse(iter(lines)), ROOT, "", "", "", 200, [],
+                             baseline=base, baseline_label=label, **kw)
+        return buf.getvalue()
+
+    def test_no_baseline_leaves_the_heading_as_it_was(self):
+        out = self.summary([diag(f"{ROOT}/src/a.cpp")])
+        self.assertIn("(1 findings)", out)
+        self.assertNotIn("Changed since", out)
+
+    def test_growth_is_signed_and_names_what_it_measures_against(self):
+        out = self.summary([diag(f"{ROOT}/src/a.cpp", 1), diag(f"{ROOT}/src/a.cpp", 2)],
+                           [diag(f"{ROOT}/src/a.cpp", 1)])
+        self.assertIn("(2 findings, +1 since run 1)", out)
+
+    def test_shrinkage_is_signed(self):
+        out = self.summary([diag(f"{ROOT}/src/a.cpp", 1)],
+                           [diag(f"{ROOT}/src/a.cpp", 1), diag(f"{ROOT}/src/a.cpp", 2)])
+        self.assertIn("(1 findings, -1 since run 1)", out)
+
+    def test_an_unchanged_night_says_so_and_renders_no_table(self):
+        line = [diag(f"{ROOT}/src/a.cpp")]
+        out = self.summary(line, line)
+        self.assertIn("unchanged since run 1", out)
+        self.assertNotIn("Changed since", out)
+
+    def test_a_check_only_today_has_reads_as_an_addition(self):
+        out = self.summary([diag(f"{ROOT}/src/a.cpp", check="bugprone-new")],
+                           [diag(f"{ROOT}/src/a.cpp", check="misc-old")])
+        self.assertIn("| +1 | [bugprone-new]", out)
+
+    def test_a_check_only_the_baseline_had_reads_as_a_removal(self):
+        out = self.summary([diag(f"{ROOT}/src/a.cpp", check="bugprone-new")],
+                           [diag(f"{ROOT}/src/a.cpp", check="misc-old")])
+        self.assertIn("| -1 | [misc-old]", out)
+
+    def test_findings_going_to_zero_still_reports_the_delta(self):
+        # The heading is the only thing rendered when there is nothing left, so
+        # without it the most interesting night of all would publish no number.
+        out = self.summary([], [diag(f"{ROOT}/src/a.cpp")])
+        self.assertIn("(0 findings, -1 since run 1)", out)
+
+    def test_biggest_movement_is_listed_first(self):
+        out = self.summary([diag(f"{ROOT}/src/a.cpp", i, check="a-small") for i in (1, 2)]
+                           + [diag(f"{ROOT}/src/b.cpp", i, check="b-big") for i in range(1, 6)],
+                           [diag(f"{ROOT}/src/a.cpp", 1, check="a-small")])
+        self.assertLess(out.index("[b-big]"), out.index("[a-small]"))
+
+    def test_a_missing_baseline_file_is_not_an_error(self):
+        # No earlier run in artifact retention is a normal state, not a failure.
+        self.assertIsNone(ctr.baseline_findings(os.path.join(HERE, "does-not-exist.txt")))
+
+    def test_no_baseline_path_means_no_baseline(self):
+        self.assertIsNone(ctr.baseline_findings(None))
+        self.assertIsNone(ctr.baseline_findings(""))
+
+    def test_the_baseline_is_normalized_like_todays_input(self):
+        # Otherwise one side spelling a header through `..` reads as a change in
+        # the code rather than a change in the path.
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write(diag(f"{ROOT}/replay/../include/h.h", 3, 7) + "\n")
+            base_path = fh.name
+        try:
+            base = ctr.baseline_findings(base_path)
+            out = self.summary([diag(f"{ROOT}/include/h.h", 3, 7)])
+            self.assertEqual([f["file"] for f in base], [f"{ROOT}/include/h.h"])
+            self.assertIn("(1 findings)", out)
+        finally:
+            os.unlink(base_path)
+
+
 class DocsUrl(unittest.TestCase):
     def test_ordinary_check_splits_on_the_first_hyphen(self):
         self.assertEqual(ctr.check_docs_url("performance-avoid-endl"),

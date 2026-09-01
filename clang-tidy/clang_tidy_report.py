@@ -12,7 +12,8 @@ or stdin:
   summary      emit a Markdown table for $GITHUB_STEP_SUMMARY where the check
                links to its documentation and the location links to the exact
                source line at the analyzed commit (used by the whole-repo
-               nightly).
+               nightly). With --baseline, also report what changed against an
+               earlier diagnostics file.
 
   count        emit the number of findings, for a workflow output.
 
@@ -189,7 +190,63 @@ def emit_annotations(findings, root):
         print(f"::warning file={path},line={f['line']},col={f['col']}::{msg}")
 
 
-def emit_summary(findings, root, server, repo, sha, top, disabled, scope="whole repo"):
+def baseline_findings(path, third_party=DEFAULT_THIRD_PARTY):
+    """Return the findings in an earlier diagnostics file, or None if unreadable.
+
+    A baseline is an earlier run's raw clang-tidy output, counted here by the
+    same `parse` as today's input so that both sides are normalized and filtered
+    identically. Counting the earlier run rather than trusting a number it
+    published is what makes the delta a statement about the analyzed code: a
+    change to this script then moves both sides equally and cancels out, where a
+    stored count would surface the script change as a jump in the trend.
+
+    An unreadable path is not an error. A baseline is unavailable whenever no
+    earlier run is in artifact retention, and a report with no delta is the
+    correct outcome there.
+
+    Args:
+        path: Path to an earlier run's diagnostics, or a falsy value for none.
+        third_party: Regex matched against the normalized path; matches are
+            discarded, as for today's input.
+
+    Returns:
+        A list of finding dicts, or None if `path` is falsy or cannot be read.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, errors="replace") as fh:
+            return list(parse(fh, third_party))
+    except OSError:
+        return None
+
+
+def delta_label(count):
+    """Return a signed count for prose, e.g. "+3" or "-28"."""
+    return f"{count:+d}"
+
+
+def summary_heading(scope, total, baseline, label):
+    """Return the report's `# ` heading, carrying the delta when there is one.
+
+    Args:
+        scope: What was analyzed, for the heading.
+        total: Today's finding count.
+        baseline: Baseline findings from `baseline_findings`, or None.
+        label: What the baseline is, for the prose (e.g. "run 123").
+
+    Returns:
+        The heading line, without a trailing newline.
+    """
+    if baseline is None:
+        return f"# clang-tidy — {scope} ({total} findings)"
+    change = total - len(baseline)
+    moved = f"{delta_label(change)} since {label}" if change else f"unchanged since {label}"
+    return f"# clang-tidy — {scope} ({total} findings, {moved})"
+
+
+def emit_summary(findings, root, server, repo, sha, top, disabled, scope="whole repo",
+                 baseline=None, baseline_label="the baseline"):
     """Print a Markdown report to stdout for $GITHUB_STEP_SUMMARY.
 
     The report has the disabled checks, counts by check and by directory, and a
@@ -207,12 +264,19 @@ def emit_summary(findings, root, server, repo, sha, top, disabled, scope="whole 
         disabled: Disabled check names to list (from `disabled_checks`).
         scope: What was analyzed, for the heading — the whole repo for the
             nightly survey, the changed lines for the diff gate.
+        baseline: Findings from an earlier run (from `baseline_findings`), or
+            None. When given, the heading carries the change and a section lists
+            it by check.
+        baseline_label: What the baseline is, for the prose — a run id or link,
+            so a reader can see what the delta is measured against.
     """
     findings = list(findings)
+    heading = summary_heading(scope, len(findings), baseline, baseline_label)
     if not findings:
         # Empty count/location tables render as bare headers, which reads as a
-        # broken report rather than a clean one.
-        print(f"# clang-tidy — {scope} (0 findings)\n\nNo findings.")
+        # broken report rather than a clean one. The heading still carries the
+        # delta: everything going away is the most interesting night there is.
+        print(f"{heading}\n\nNo findings.")
         return
     by_check = Counter(f["check"] for f in findings)
     by_dir = Counter()
@@ -221,7 +285,25 @@ def emit_summary(findings, root, server, repo, sha, top, disabled, scope="whole 
         by_dir["/".join(parts[:3]) if len(parts) > 3 else "/".join(parts[:-1])] += 1
 
     out = []
-    out.append(f"# clang-tidy — {scope} ({len(findings)} findings)\n")
+    out.append(f"{heading}\n")
+    if baseline is not None:
+        base_by_check = Counter(f["check"] for f in baseline)
+        moved = {c: by_check[c] - base_by_check[c]
+                 for c in set(by_check) | set(base_by_check)
+                 if by_check[c] != base_by_check[c]}
+        # Only when something moved. An unchanged night rendering an empty table
+        # reads as a broken report, and the heading already says "unchanged".
+        if moved:
+            out.append("## Changed since the baseline\n")
+            out.append("| change | check |")
+            out.append("|-------:|-------|")
+            # Biggest movement first, then by name so equal changes hold a stable
+            # order across runs and two reports can be diffed.
+            for check, change in sorted(moved.items(), key=lambda kv: (-abs(kv[1]), kv[0])):
+                url = check_docs_url(check)
+                label = f"[{check}]({url})" if url else check
+                out.append(f"| {delta_label(change)} | {label} |")
+            out.append("")
     if disabled:
         out.append("## Disabled checks (not enforced)\n")
         for check in disabled:
@@ -264,7 +346,8 @@ def main():
 
     Reads diagnostics from `--input` (or stdin) and dispatches on the `mode`
     positional: `annotations` for the diff-only gate, `summary` for the nightly,
-    `count` for the action's findings-count output.
+    `count` for the action's findings-count output. In summary mode `--baseline`
+    adds the change against an earlier run's diagnostics.
     The GitHub context defaults come from the standard Actions environment
     variables so the workflows can call this with no extra flags.
     """
@@ -285,6 +368,14 @@ def main():
     ap.add_argument("--third-party-regex", default=DEFAULT_THIRD_PARTY,
                     help="paths matching this are not this repository's findings; "
                          "pass an empty string to keep everything")
+    ap.add_argument("--baseline", default=None,
+                    help="summary mode: an earlier run's diagnostics to report the "
+                         "change against. A path that cannot be read renders the "
+                         "report without a delta rather than failing, because no "
+                         "earlier run being in retention is a normal state")
+    ap.add_argument("--baseline-label", default="the baseline",
+                    help="what --baseline is, for the heading prose (e.g. a run id "
+                         "or link), so a reader can see what the delta measures against")
     args = ap.parse_args()
 
     stream = sys.stdin if args.input == "-" else open(args.input, errors="replace")
@@ -296,7 +387,9 @@ def main():
     else:
         config = args.config or os.path.join(args.repo_root, ".clang-tidy")
         emit_summary(findings, args.repo_root, args.server, args.repo, args.sha,
-                     args.top, disabled_checks(config), args.scope)
+                     args.top, disabled_checks(config), args.scope,
+                     baseline_findings(args.baseline, args.third_party_regex),
+                     args.baseline_label)
 
 
 if __name__ == "__main__":
