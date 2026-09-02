@@ -24,7 +24,7 @@ import argparse
 import os
 import re
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 
 # <path>:<line>:<col>: <warning|error>: <message> [<check>(,<check>)*]
 DIAG = re.compile(
@@ -249,10 +249,10 @@ def emit_summary(findings, root, server, repo, sha, top, disabled, scope="whole 
                  baseline=None, baseline_label="the baseline"):
     """Print a Markdown report to stdout for $GITHUB_STEP_SUMMARY.
 
-    The report has the disabled checks, counts by check and by directory, and a
-    findings table capped at `top` rows. When server/repo/sha are all given,
-    each check links to its documentation and each location links to the source
-    line at the analyzed commit.
+    The report has the disabled checks, counts by check, by directory and by
+    file, and a per-finding table capped at `top` rows, which `top` of 0 drops.
+    When server/repo/sha are all given, each check links to its documentation,
+    each file and location to the source at the analyzed commit.
 
     Args:
         findings: An iterable of finding dicts from `parse`.
@@ -260,7 +260,7 @@ def emit_summary(findings, root, server, repo, sha, top, disabled, scope="whole 
         server: GitHub server URL (GITHUB_SERVER_URL) for source links.
         repo: "owner/name" (GITHUB_REPOSITORY) for source links.
         sha: Commit SHA (GITHUB_SHA) the source links point at.
-        top: Maximum number of rows in the findings table.
+        top: Maximum number of rows in the per-finding table; 0 drops it.
         disabled: Disabled check names to list (from `disabled_checks`).
         scope: What was analyzed, for the heading — the whole repo for the
             nightly survey, the changed lines for the diff gate.
@@ -280,9 +280,12 @@ def emit_summary(findings, root, server, repo, sha, top, disabled, scope="whole 
         return
     by_check = Counter(f["check"] for f in findings)
     by_dir = Counter()
+    by_file = defaultdict(Counter)
     for f in findings:
-        parts = rel(f["file"], root).split("/")
+        path = rel(f["file"], root)
+        parts = path.split("/")
         by_dir["/".join(parts[:3]) if len(parts) > 3 else "/".join(parts[:-1])] += 1
+        by_file[path][f["check"]] += 1
 
     out = []
     out.append(f"{heading}\n")
@@ -324,6 +327,35 @@ def emit_summary(findings, root, server, repo, sha, top, disabled, scope="whole 
     for d, n in by_dir.most_common():
         out.append(f"| {n} | {d} |")
 
+    # What a given file violates, which neither of the tables above can answer:
+    # one counts a check across the repository, the other counts a directory. This
+    # is what someone about to work in a file needs, and unlike a capped list of
+    # individual findings it is complete -- every file, every check it breaks.
+    #
+    # Checks are named rather than linked: `By check` above already carries their
+    # documentation links, and repeating them here triples the section's size for
+    # a link the reader has seen twice.
+    out.append("\n## By file\n")
+    out.append("| file | findings | checks violated |")
+    out.append("|------|---------:|-----------------|")
+    # Worst file first, then by name so equal totals hold a stable order and two
+    # reports can be diffed. Long cells are not trimmed: a capped list of what a
+    # file violates is the thing this section replaces.
+    for path, checks in sorted(by_file.items(), key=lambda kv: (-sum(kv[1].values()), kv[0])):
+        label = f"[{path}]({server}/{repo}/blob/{sha}/{path})" if server and repo and sha else path
+        violated = ", ".join(f"{c} ({n})" for c, n in
+                             sorted(checks.items(), key=lambda kv: (-kv[1], kv[0])))
+        out.append(f"| {label} | {sum(checks.values())} | {violated} |")
+
+    # `top` of 0 drops the per-finding table. A whole-repo survey has orders of
+    # magnitude more findings than a step summary can hold, so the table there is
+    # necessarily a window on whichever units the compile database happens to list
+    # first -- the same rows every run, whatever the code did. The diff gate is
+    # the case it serves: scoped to changed lines, the list is short and complete.
+    if not top:
+        print("\n".join(out))
+        return
+
     out.append(f"\n## Findings (first {top})\n")
     out.append("| check | location | message |")
     out.append("|-------|----------|---------|")
@@ -358,7 +390,11 @@ def main():
     ap.add_argument("--server", default=os.environ.get("GITHUB_SERVER_URL", ""))
     ap.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
     ap.add_argument("--sha", default=os.environ.get("GITHUB_SHA", ""))
-    ap.add_argument("--top", type=int, default=200, help="max rows in the findings table")
+    ap.add_argument("--top", type=int, default=200,
+                    help="max rows in the per-finding table; 0 drops that table, "
+                         "which is what a whole-repo survey wants -- it has far more "
+                         "findings than a step summary holds, so any cap there shows "
+                         "the same arbitrary rows every run")
     ap.add_argument("--config", default=None,
                     help="path to .clang-tidy for the disabled-checks section "
                          "(default: <repo-root>/.clang-tidy)")
