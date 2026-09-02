@@ -86,6 +86,62 @@ class Parse(unittest.TestCase):
         self.assertEqual(len(got), 1)
 
 
+class ByFile(unittest.TestCase):
+    """The per-file section and the per-finding table it replaces."""
+
+    def summary(self, lines, top=200, **kw):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ctr.emit_summary(ctr.parse(iter(lines)), ROOT, "", "", "", top, [], **kw)
+        return buf.getvalue()
+
+    def test_a_file_lists_every_check_it_violates_with_counts(self):
+        out = self.summary([diag(f"{ROOT}/src/a.cpp", 1, check="x-one"),
+                            diag(f"{ROOT}/src/a.cpp", 2, check="x-one"),
+                            diag(f"{ROOT}/src/a.cpp", 3, check="y-two")])
+        self.assertIn("| src/a.cpp | 3 | x-one (2), y-two (1) |", out)
+
+    def test_files_are_listed_worst_first(self):
+        out = self.summary([diag(f"{ROOT}/src/small.cpp", 1)]
+                           + [diag(f"{ROOT}/src/big.cpp", i) for i in range(1, 4)])
+        self.assertLess(out.index("src/big.cpp"), out.index("src/small.cpp"))
+
+    def test_equal_totals_are_ordered_by_name(self):
+        # Two reports of the same repository should diff cleanly.
+        out = self.summary([diag(f"{ROOT}/src/b.cpp"), diag(f"{ROOT}/src/a.cpp")])
+        self.assertLess(out.index("src/a.cpp"), out.index("src/b.cpp"))
+
+    def test_the_file_links_to_the_analyzed_commit(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ctr.emit_summary(ctr.parse(iter([diag(f"{ROOT}/src/a.cpp")])), ROOT,
+                             "https://gh", "o/r", "cafe", 200, [])
+        self.assertIn("[src/a.cpp](https://gh/o/r/blob/cafe/src/a.cpp)", buf.getvalue())
+
+    def test_checks_are_named_not_linked(self):
+        # `By check` already carries the documentation links.
+        out = self.summary([diag(f"{ROOT}/src/a.cpp", check="misc-thing")])
+        row = [ln for ln in out.splitlines() if ln.startswith("| src/a.cpp")][0]
+        self.assertNotIn("http", row)
+
+    def test_top_of_zero_drops_the_per_finding_table(self):
+        out = self.summary([diag(f"{ROOT}/src/a.cpp")], top=0)
+        self.assertNotIn("## Findings", out)
+        self.assertIn("## By file", out)
+
+    def test_a_nonzero_top_keeps_the_per_finding_table(self):
+        out = self.summary([diag(f"{ROOT}/src/a.cpp")], top=200)
+        self.assertIn("## Findings (first 200)", out)
+
+    def test_by_file_is_complete_even_when_the_finding_table_is_capped(self):
+        # The cap is why the per-file view exists: it is an aggregate, so it
+        # covers every file whatever `top` is.
+        lines = [diag(f"{ROOT}/src/f{i}.cpp") for i in range(5)]
+        out = self.summary(lines, top=2)
+        for i in range(5):
+            self.assertIn(f"src/f{i}.cpp", out)
+
+
 class Baseline(unittest.TestCase):
     """The delta against an earlier run's diagnostics."""
 
