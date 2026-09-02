@@ -95,11 +95,31 @@ class ByFile(unittest.TestCase):
             ctr.emit_summary(ctr.parse(iter(lines)), ROOT, "", "", "", top, [], **kw)
         return buf.getvalue()
 
+    def by_file(self, lines, **kw):
+        """Return only the `By file` section, so later sections cannot match."""
+        after = self.summary(lines, **kw).split("## By file", 1)[1]
+        return after.split("\n## ", 1)[0]
+
     def test_a_file_lists_every_check_it_violates_with_counts(self):
         out = self.summary([diag(f"{ROOT}/src/a.cpp", 1, check="x-one"),
                             diag(f"{ROOT}/src/a.cpp", 2, check="x-one"),
                             diag(f"{ROOT}/src/a.cpp", 3, check="y-two")])
-        self.assertIn("| src/a.cpp | 3 | x-one (2), y-two (1) |", out)
+        self.assertIn("| **src/a.cpp** _(3)_ | x-one | 2 |", out)
+        self.assertIn("|  | y-two | 1 |", out)
+
+    def test_the_path_appears_once_per_group(self):
+        # The rows after the first read as a list under the file, so repeating the
+        # path on each would be noise -- and it is the whole reason a row per
+        # check costs less than a cell per file.
+        section = self.by_file([diag(f"{ROOT}/src/a.cpp", 1, check="x-one"),
+                                diag(f"{ROOT}/src/a.cpp", 2, check="y-two")])
+        self.assertEqual(section.count("src/a.cpp"), 1)
+
+    def test_within_a_file_the_worst_check_is_first(self):
+        section = self.by_file([diag(f"{ROOT}/src/a.cpp", 1, check="rare-one")]
+                               + [diag(f"{ROOT}/src/a.cpp", i, check="common-two")
+                                  for i in range(2, 6)])
+        self.assertLess(section.index("common-two"), section.index("rare-one"))
 
     def test_files_are_listed_worst_first(self):
         out = self.summary([diag(f"{ROOT}/src/small.cpp", 1)]
@@ -116,12 +136,13 @@ class ByFile(unittest.TestCase):
         with redirect_stdout(buf):
             ctr.emit_summary(ctr.parse(iter([diag(f"{ROOT}/src/a.cpp")])), ROOT,
                              "https://gh", "o/r", "cafe", 200, [])
-        self.assertIn("[src/a.cpp](https://gh/o/r/blob/cafe/src/a.cpp)", buf.getvalue())
+        self.assertIn("**[src/a.cpp](https://gh/o/r/blob/cafe/src/a.cpp)** _(1)_",
+                      buf.getvalue())
 
     def test_checks_are_named_not_linked(self):
         # `By check` already carries the documentation links.
-        out = self.summary([diag(f"{ROOT}/src/a.cpp", check="misc-thing")])
-        row = [ln for ln in out.splitlines() if ln.startswith("| src/a.cpp")][0]
+        section = self.by_file([diag(f"{ROOT}/src/a.cpp", check="misc-thing")])
+        row = [ln for ln in section.splitlines() if "misc-thing" in ln][0]
         self.assertNotIn("http", row)
 
     def test_top_of_zero_drops_the_per_finding_table(self):
