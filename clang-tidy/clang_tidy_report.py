@@ -336,16 +336,24 @@ def emit_summary(findings, root, server, repo, sha, top, disabled, scope="whole 
     # documentation links, and repeating them here triples the section's size for
     # a link the reader has seen twice.
     out.append("\n## By file\n")
-    out.append("| file | findings | checks violated |")
-    out.append("|------|---------:|-----------------|")
+    out.append("| file | check | count |")
+    out.append("|------|-------|------:|")
+    # A row per check rather than a file's checks packed into one cell. A cell
+    # holding one file's 38 checks makes a row 38 lines tall beside rows of one,
+    # and the counts end up buried in running text; a row each keeps the heights
+    # even and puts the count in a column that lines up and can be read down.
+    #
+    # The path carries the file's total and appears once, on the first row of its
+    # group, so the rest read as a list under it.
+    #
     # Worst file first, then by name so equal totals hold a stable order and two
-    # reports can be diffed. Long cells are not trimmed: a capped list of what a
-    # file violates is the thing this section replaces.
+    # reports can be diffed. Within a file, the check it breaks most first.
     for path, checks in sorted(by_file.items(), key=lambda kv: (-sum(kv[1].values()), kv[0])):
-        label = f"[{path}]({server}/{repo}/blob/{sha}/{path})" if server and repo and sha else path
-        violated = ", ".join(f"{c} ({n})" for c, n in
-                             sorted(checks.items(), key=lambda kv: (-kv[1], kv[0])))
-        out.append(f"| {label} | {sum(checks.values())} | {violated} |")
+        link = f"[{path}]({server}/{repo}/blob/{sha}/{path})" if server and repo and sha else path
+        head = f"**{link}** _({sum(checks.values())})_"
+        for check, n in sorted(checks.items(), key=lambda kv: (-kv[1], kv[0])):
+            out.append(f"| {head} | {check} | {n} |")
+            head = ""
 
     # `top` of 0 drops the per-finding table. A whole-repo survey has orders of
     # magnitude more findings than a step summary can hold, so the table there is
