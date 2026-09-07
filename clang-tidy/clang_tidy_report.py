@@ -27,8 +27,20 @@ import sys
 from collections import Counter, defaultdict
 
 # <path>:<line>:<col>: <warning|error>: <message> [<check>(,<check>)*]
+#
+# The path may be absolute or repo-relative. clang-tidy itself prints absolute
+# paths, but a report crossing machines has to be recorded relative to the tree:
+# the same checkout sits at a different absolute path on a CI runner than on a
+# compute node, and a per-run prefix would make two nights incomparable by path.
+# Requiring a leading slash silently matched nothing on such a report, which
+# reads as a clean repository rather than an unparsed one.
+#
+# `[^\s:]` on the first character is what keeps this from matching prose: a
+# diagnostic path never starts with whitespace or a colon, and `[^:]` for the
+# rest cannot cross the colon that follows, so a sentence containing a colon
+# cannot be read as a path.
 DIAG = re.compile(
-    r"^(?P<file>/[^:]+):(?P<line>\d+):(?P<col>\d+):\s+"
+    r"^(?P<file>[^\s:][^:]*):(?P<line>\d+):(?P<col>\d+):\s+"
     r"(?:warning|error):\s+(?P<msg>.*?)\s+\[(?P<checks>[^\]]+)\]\s*$"
 )
 
@@ -39,7 +51,12 @@ DIAG = re.compile(
 # prints the header's location, so the path is the last word on whether a finding
 # belongs to this repository. The default matches the conventional directory names;
 # consumers that vendor elsewhere override it with --third-party-regex.
-DEFAULT_THIRD_PARTY = r"/(vendor|deps|examples)/"
+# Anchored at either a slash or the start of the path, so it filters the same
+# whether the path is absolute (`/w/tree/vendor/x.h`) or repo-relative
+# (`vendor/x.h`). Matching only on a leading slash would let every top-level
+# third-party directory through on a relative report -- a leak that is easy to
+# miss, because it moves the total by a few dozen rather than visibly.
+DEFAULT_THIRD_PARTY = r"(^|/)(vendor|deps|examples)/"
 
 
 def check_docs_url(check):

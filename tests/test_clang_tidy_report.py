@@ -85,6 +85,42 @@ class Parse(unittest.TestCase):
         got = self.parse([diag(f"{ROOT}/vendor/x.cpp")], third_party="")
         self.assertEqual(len(got), 1)
 
+    def test_repo_relative_paths_are_parsed(self):
+        # A survey that crossed machines is recorded relative to the tree, because
+        # the same checkout sits at a different absolute path on each. Requiring a
+        # leading slash matched none of it, and a report of zero findings reads as
+        # a clean repository rather than an unparsed one.
+        got = self.parse([diag("src/a.cpp", 12, 5, "avoid endl", "performance-avoid-endl")])
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["file"], "src/a.cpp")
+
+    def test_third_party_is_dropped_from_a_repo_relative_report(self):
+        # The filter has to anchor at the start of the path as well as at a slash.
+        # On a relative report the third-party directory IS the first segment, so a
+        # slash-only pattern lets every one of them through -- a leak worth a few
+        # dozen findings, which moves the total without looking wrong.
+        got = self.parse([diag("src/a.cpp"), diag("vendor/lib/x.h"),
+                          diag("deps/y/z.cpp"), diag("examples/e.cpp")])
+        self.assertEqual([f["file"] for f in got], ["src/a.cpp"])
+
+    def test_a_relative_report_and_an_absolute_one_agree(self):
+        # The same findings, spelled both ways, must survive the filter identically:
+        # relativizing a report must not change what it says.
+        both = [("src/a.cpp", f"{ROOT}/src/a.cpp"),
+                ("vendor/lib/x.h", f"{ROOT}/vendor/lib/x.h"),
+                ("include/h.h", f"{ROOT}/include/h.h")]
+        rel = self.parse([diag(r) for r, _ in both])
+        absolute = self.parse([diag(a) for _, a in both])
+        self.assertEqual([f["file"] for f in rel],
+                         [ctr.rel(f["file"], ROOT) for f in absolute])
+
+    def test_relative_notes_and_context_are_still_ignored(self):
+        # Relaxing the path pattern must not widen what counts as a finding.
+        noise = ["src/a.cpp:1:1: note: expanded from", "1 warning generated.",
+                 "  int x = 0;", "      ^",
+                 "Suppressed 3 warnings (3 in non-user code)."]
+        self.assertEqual(self.parse(noise), [])
+
 
 class ByFile(unittest.TestCase):
     """The per-file section and the per-finding table it replaces."""
@@ -161,6 +197,32 @@ class ByFile(unittest.TestCase):
         out = self.summary(lines, top=2)
         for i in range(5):
             self.assertIn(f"src/f{i}.cpp", out)
+
+
+class ByDirectory(unittest.TestCase):
+    """The per-directory section, which a bad path collapses into one row."""
+
+    def by_directory(self, lines, **kw):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            ctr.emit_summary(ctr.parse(iter(lines)), ROOT, "", "", "", 0, [], **kw)
+        after = buf.getvalue().split("## By directory", 1)[1]
+        return after.split("\n## ", 1)[0]
+
+    def test_repo_relative_paths_group_by_their_own_directories(self):
+        # Grouping takes the first three segments, so a path that still carries a
+        # machine prefix buckets every finding in the repository under that prefix
+        # and the section renders a single useless row.
+        out = self.by_directory([diag("src/Frontend/a.cpp"),
+                                 diag("include/niobium/Utils/Logging.h"),
+                                 diag("replay/src/replay.cpp")])
+        self.assertIn("| 1 | src/Frontend |", out)
+        self.assertIn("| 1 | include/niobium/Utils |", out)
+        self.assertIn("| 1 | replay/src |", out)
+
+    def test_a_shallow_path_groups_under_its_own_directory(self):
+        out = self.by_directory([diag("src/a.cpp")])
+        self.assertIn("| 1 | src |", out)
 
 
 class Baseline(unittest.TestCase):
