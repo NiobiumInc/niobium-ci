@@ -57,6 +57,7 @@ JSON
 
     stub clean  'exit 0'
     stub find   "echo \"\$REPO/src/a.cpp:2:1: warning: found [modernize-use-auto]\"; exit 1"
+    stub block  "echo \"\$REPO/src/a.cpp:2:1: error: found [bugprone-empty-catch,-warnings-as-errors]\"; exit 1"
     stub crash  'echo "PLEASE submit a bug report" >&2; exit 139'
     stub oldver 'exit 0' 19.9.9
 
@@ -148,6 +149,61 @@ if [ "$(cat clang-tidy-status.txt 2>/dev/null)" = "0" ]; then
     ok "diff: a clean run replaces the previous status rather than leaving it"
 else
     no "diff: a clean run replaces the previous status" "got '$(cat clang-tidy-status.txt 2>/dev/null)'"
+fi
+
+# --- what counts as a failure ----------------------------------------------
+# A project names its blocking tier in its own .clang-tidy, by escalating those checks
+# under WarningsAsErrors. So the severity clang-tidy printed carries the decision, and
+# this script reads it rather than keeping a list of checks that could disagree with
+# the configuration a developer reads.
+setup; fake_driver; change_a_compiled_source
+
+export CLANG_TIDY_BIN="$REPO/bin/ct-find"          # reports a warning
+expect_rc 1 "block-on: unset keeps today's behaviour, every finding fails" \
+    bash "$SUT" diff
+expect_rc 1 "block-on findings: a warning fails" \
+    env CLANG_TIDY_BLOCK_ON=findings bash "$SUT" diff
+expect_rc 0 "block-on errors: a warning-only report is not a failure" \
+    env CLANG_TIDY_BLOCK_ON=errors bash "$SUT" diff
+expect_rc 1 "block-on none: findings still publish status 1, only the message changes" \
+    env CLANG_TIDY_BLOCK_ON=none bash "$SUT" diff
+
+export CLANG_TIDY_BIN="$REPO/bin/ct-block"         # reports an error
+expect_rc 1 "block-on errors: an error-severity finding fails" \
+    env CLANG_TIDY_BLOCK_ON=errors bash "$SUT" diff
+
+expect_rc 2 "an unrecognised block-on exits 2 rather than guessing a policy" \
+    env CLANG_TIDY_BLOCK_ON=sometimes bash "$SUT" diff
+
+# GitHub renders ::error:: red, so it has to mean the job is failing. Printing one
+# over a run that passed tells a reader the opposite of what happened.
+export CLANG_TIDY_BIN="$REPO/bin/ct-find"
+expect_out "^clang-tidy: findings on changed lines, none at error severity" \
+    "block-on errors: a downgraded run says so without an error annotation" \
+    env CLANG_TIDY_BLOCK_ON=errors bash "$SUT" diff
+for mode in errors none; do
+    out="$(env CLANG_TIDY_BLOCK_ON=$mode bash "$SUT" diff 2>&1)"
+    if grep -q '::error::' <<<"$out"; then
+        no "block-on $mode: no ::error:: over findings the caller does not fail on" "found one"
+    else
+        ok "block-on $mode: no ::error:: over findings the caller does not fail on"
+    fi
+done
+out="$(env CLANG_TIDY_BLOCK_ON=findings bash "$SUT" diff 2>&1)"
+if grep -q '::error::' <<<"$out"; then
+    ok "block-on findings: an ::error:: annotation, because the run is failing"
+else
+    no "block-on findings: an ::error:: annotation, because the run is failing" "none found"
+fi
+
+# The status file is what a caller reads back through `make`, so the downgrade has to
+# reach it too, not only the exit code.
+export CLANG_TIDY_BIN="$REPO/bin/ct-find"
+env CLANG_TIDY_BLOCK_ON=errors bash "$SUT" diff >/dev/null 2>&1
+if [ "$(cat clang-tidy-status.txt 2>/dev/null)" = "0" ]; then
+    ok "block-on errors: a downgraded run publishes status 0"
+else
+    no "block-on errors: a downgraded run publishes status 0" "got '$(cat clang-tidy-status.txt 2>/dev/null)'"
 fi
 
 # --- selection -------------------------------------------------------------
