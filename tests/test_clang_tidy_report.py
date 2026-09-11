@@ -59,6 +59,13 @@ class Parse(unittest.TestCase):
                           diag(f"{ROOT}/src/a.cpp", 3, 7, check="b-two")])
         self.assertEqual(len(got), 2)
 
+    def test_severity_is_kept(self):
+        # WarningsAsErrors is how a project names its blocking tier, so the word
+        # clang-tidy printed carries that decision and is not the parser's to discard.
+        got = self.parse([diag(f"{ROOT}/src/a.cpp", severity="error"),
+                          diag(f"{ROOT}/src/b.cpp", severity="warning")])
+        self.assertEqual([f["severity"] for f in got], ["error", "warning"])
+
     def test_warnings_as_errors_tag_is_stripped(self):
         got = self.parse([f"{ROOT}/src/a.cpp:1:1: error: m [modernize-use-auto,-warnings-as-errors]"])
         self.assertEqual(got[0]["check"], "modernize-use-auto")
@@ -355,6 +362,16 @@ class Rendering(unittest.TestCase):
         self.assertIn("::warning file=src/a.cpp,line=4,col=2::", out)
         self.assertNotIn(ROOT + "/src", out)
 
+    def test_annotations_follow_the_diagnostic_severity(self):
+        # Red for what fails the job, yellow for what does not. Rendering both the
+        # same way puts the author back in the job log to tell them apart.
+        out = self.render(ctr.emit_annotations,
+                          ctr.parse(iter([diag(f"{ROOT}/src/a.cpp", 4, 2, severity="error"),
+                                          diag(f"{ROOT}/src/b.cpp", 9, 1, severity="warning")])),
+                          ROOT)
+        self.assertIn("::error file=src/a.cpp,line=4,col=2::", out)
+        self.assertIn("::warning file=src/b.cpp,line=9,col=1::", out)
+
     def test_summary_of_nothing_says_so_instead_of_rendering_bare_headers(self):
         out = self.render(ctr.emit_summary, iter([]), ROOT, "", "", "", 10, [], "changed lines")
         self.assertIn("changed lines (0 findings)", out)
@@ -381,6 +398,40 @@ class Rendering(unittest.TestCase):
                           ctr.parse(iter([diag(f"{ROOT}/src/a.cpp", msg="a | b")])),
                           ROOT, "", "", "", 10, [], "whole repo")
         self.assertIn(r"a \| b", out)
+
+
+class Count(unittest.TestCase):
+    """`count` mode, which is the number a gate reports and acts on."""
+
+    REPORT = "\n".join([
+        diag(f"{ROOT}/src/a.cpp", 1, 1, severity="error"),
+        diag(f"{ROOT}/src/b.cpp", 2, 1, severity="warning"),
+        diag(f"{ROOT}/src/c.cpp", 3, 1, severity="warning"),
+    ])
+
+    def count(self, *extra):
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write(self.REPORT + "\n")
+        argv = ["clang_tidy_report.py", "count", "-i", fh.name, "--repo-root", ROOT]
+        buf = io.StringIO()
+        old = sys.argv
+        try:
+            sys.argv = argv + list(extra)
+            with redirect_stdout(buf):
+                ctr.main()
+        finally:
+            sys.argv = old
+            os.unlink(fh.name)
+        return buf.getvalue().strip()
+
+    def test_counts_everything_by_default(self):
+        self.assertEqual(self.count(), "3")
+
+    def test_error_severity_counts_only_the_blocking_tier(self):
+        self.assertEqual(self.count("--severity", "error"), "1")
+
+    def test_warning_severity_counts_only_what_does_not_block(self):
+        self.assertEqual(self.count("--severity", "warning"), "2")
 
 
 if __name__ == "__main__":

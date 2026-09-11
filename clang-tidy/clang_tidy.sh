@@ -19,6 +19,14 @@
 #
 # Configuration arrives in the environment; the consumer's Makefile owns the values.
 # No secrets are read, written or required.
+#
+# CLANG_TIDY_BLOCK_ON says which findings count as a failure in `diff` mode:
+#   findings  all of them. The default, and what a project with a single tier wants.
+#   errors    only a diagnostic clang-tidy printed as `error:`, which is what the
+#             project's own .clang-tidy escalated under WarningsAsErrors. The
+#             blocking tier is named there, so this script needs no list of checks
+#             and cannot disagree with the configuration a developer reads.
+#   none      none of them; the caller reports findings without acting on them.
 set -uo pipefail
 
 MODE="${1:?usage: clang_tidy.sh check-tool|diff|all}"
@@ -29,6 +37,7 @@ HELPERS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CLANG_TIDY_BUILD_DIR:=build}"
 : "${CLANG_TIDY_BIN:=clang-tidy}"
 : "${CLANG_TIDY_COMMITTED:=0}"
+: "${CLANG_TIDY_BLOCK_ON:=findings}"
 CLANG_TIDY_BASE="${CLANG_TIDY_BASE:-}"
 DB="$CLANG_TIDY_BUILD_DIR/compile_commands.json"
 STATUS_FILE="clang-tidy-status.txt"
@@ -50,6 +59,12 @@ err() { echo "::error::$*" >&2; }
 # analysis that did not run, which is worse than no gate at all.
 # --------------------------------------------------------------------------
 readonly EX_FINDINGS=1 EX_NOVERDICT=2
+
+case "$CLANG_TIDY_BLOCK_ON" in
+    findings|errors|none) ;;
+    *) err "CLANG_TIDY_BLOCK_ON must be findings, errors or none, not '$CLANG_TIDY_BLOCK_ON'."
+       exit "$EX_NOVERDICT" ;;
+esac
 
 # --------------------------------------------------------------------------
 # CLANG_TIDY_SCOPE is a git pathspec and answers one question: is this product
@@ -155,6 +170,39 @@ toolchain_args() {
     [ -n "$dir" ] && printf '%s\n' "--gcc-install-dir=$dir"
 }
 
+# --------------------------------------------------------------------------
+# There are findings. What they mean is the caller's policy, so say it the way that
+# caller will act on it rather than asserting one answer for every consumer.
+#
+# The ::error:: prefix that err() adds is reserved for the cases that actually fail:
+# GitHub renders it red, and a red annotation over a check that passed tells a
+# reader the opposite of what happened. That is why a lenient caller gets a plain
+# line here, and why `none` still returns EX_FINDINGS -- the exit code answers "were
+# there findings?", which is true regardless of what the caller does about them.
+#
+# Anchored to the diagnostic shape rather than matching " error: " anywhere, so a
+# finding whose own message quotes the word cannot be read as one.
+# --------------------------------------------------------------------------
+findings_verdict() {
+    local fix="Fix them, or deviate a false positive inline with // NOLINT(check-name): <reason>."
+    case "$CLANG_TIDY_BLOCK_ON" in
+        errors)
+            if ! grep -qE '^.+:[0-9]+:[0-9]+: error: ' clang-tidy-report.txt; then
+                echo "clang-tidy: findings on changed lines, none at error severity." >&2
+                return 0
+            fi
+            err "clang-tidy reported blocking findings on changed lines. $fix"
+            ;;
+        none)
+            echo "clang-tidy reported findings on changed lines." >&2
+            ;;
+        *)
+            err "clang-tidy reported findings on changed lines. $fix"
+            ;;
+    esac
+    return "$EX_FINDINGS"
+}
+
 lint_diff() {
     [ -n "$CLANG_TIDY_BASE" ] || { err "CLANG_TIDY_BASE is empty — no diff base to compare against."; return "$EX_NOVERDICT"; }
     # An explicit setting first, then the copy clang-tools-extra installs, then what
@@ -220,8 +268,8 @@ lint_diff() {
         return "$EX_NOVERDICT"
     fi
     if grep -nE ' (warning|error): ' clang-tidy-report.txt; then
-        err "clang-tidy reported findings on changed lines. Fix them, or deviate a false positive inline with // NOLINT(check-name): <reason>."
-        return "$EX_FINDINGS"
+        findings_verdict
+        return $?
     fi
     if [ "$rc" -ne 0 ]; then
         err "clang-tidy exited with status $rc but reported no findings and no crash — check the output above."

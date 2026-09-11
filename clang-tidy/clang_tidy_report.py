@@ -41,7 +41,7 @@ from collections import Counter, defaultdict
 # cannot be read as a path.
 DIAG = re.compile(
     r"^(?P<file>[^\s:][^:]*):(?P<line>\d+):(?P<col>\d+):\s+"
-    r"(?:warning|error):\s+(?P<msg>.*?)\s+\[(?P<checks>[^\]]+)\]\s*$"
+    r"(?P<severity>warning|error):\s+(?P<msg>.*?)\s+\[(?P<checks>[^\]]+)\]\s*$"
 )
 
 # Code owned by other projects, which each analyse their own. A .clang-tidy
@@ -140,7 +140,11 @@ def parse(stream, third_party=DEFAULT_THIRD_PARTY):
             discarded.
 
     Yields:
-        A dict per unique finding with keys: file, line, col, msg, check.
+        A dict per unique finding with keys: file, line, col, msg, check,
+        severity. Severity is the word clang-tidy printed, which WarningsAsErrors
+        decides: a project that escalates only some checks is telling the reader
+        which findings it considers serious, and that is worth carrying rather
+        than discarding here.
     """
     third_party_re = re.compile(third_party) if third_party else None
     seen = set()
@@ -174,6 +178,7 @@ def parse(stream, third_party=DEFAULT_THIRD_PARTY):
             "col": m["col"],
             "msg": m["msg"],
             "check": check,
+            "severity": m["severity"],
         }
 
 
@@ -192,10 +197,15 @@ def rel(path, root):
 
 
 def emit_annotations(findings, root):
-    """Print a GitHub `::warning` workflow command for each finding.
+    """Print a GitHub workflow command for each finding, at its own severity.
 
     GitHub renders these inline on the finding's line in a PR's Files-changed
     view, so paths must be repo-relative.
+
+    An `error:` diagnostic is annotated as `::error` and a warning as `::warning`.
+    Where a project escalates only its serious checks, that is what tells the two
+    tiers apart in the diff view; where it escalates all of them or none, every
+    annotation is the one kind and this is the behaviour it always had.
 
     Args:
         findings: An iterable of finding dicts from `parse`.
@@ -204,7 +214,8 @@ def emit_annotations(findings, root):
     for f in findings:
         path = rel(f["file"], root)
         msg = f"{f['check']}: {f['msg']}"
-        print(f"::warning file={path},line={f['line']},col={f['col']}::{msg}")
+        level = "error" if f.get("severity") == "error" else "warning"
+        print(f"::{level} file={path},line={f['line']},col={f['col']}::{msg}")
 
 
 def baseline_findings(path, third_party=DEFAULT_THIRD_PARTY):
@@ -403,8 +414,9 @@ def main():
 
     Reads diagnostics from `--input` (or stdin) and dispatches on the `mode`
     positional: `annotations` for the diff-only gate, `summary` for the nightly,
-    `count` for the action's findings-count output. In summary mode `--baseline`
-    adds the change against an earlier run's diagnostics.
+    `count` for the action's findings-count output. In count mode `--severity`
+    narrows to one severity; in summary mode `--baseline` adds the change against
+    an earlier run's diagnostics.
     The GitHub context defaults come from the standard Actions environment
     variables so the workflows can call this with no extra flags.
     """
@@ -434,23 +446,36 @@ def main():
                          "change against. A path that cannot be read renders the "
                          "report without a delta rather than failing, because no "
                          "earlier run being in retention is a normal state")
+    ap.add_argument("--severity", choices=["all", "error", "warning"], default="all",
+                    help="count mode: count only findings clang-tidy printed at this "
+                         "severity. A project that escalates only its serious checks "
+                         "blocks on `error` and reports the rest, so the two counts "
+                         "are what its gate needs to say what happened")
     ap.add_argument("--baseline-label", default="the baseline",
                     help="what --baseline is, for the heading prose (e.g. a run id "
                          "or link), so a reader can see what the delta measures against")
     args = ap.parse_args()
 
     stream = sys.stdin if args.input == "-" else open(args.input, errors="replace")
-    findings = parse(stream, args.third_party_regex)
-    if args.mode == "annotations":
-        emit_annotations(findings, args.repo_root)
-    elif args.mode == "count":
-        print(sum(1 for _ in findings))
-    else:
-        config = args.config or os.path.join(args.repo_root, ".clang-tidy")
-        emit_summary(findings, args.repo_root, args.server, args.repo, args.sha,
-                     args.top, disabled_checks(config), args.scope,
-                     baseline_findings(args.baseline, args.third_party_regex),
-                     args.baseline_label)
+    try:
+        # parse() is a generator, so the file has to stay open while a mode consumes
+        # it; closing is what the process exit used to do implicitly.
+        findings = parse(stream, args.third_party_regex)
+        if args.mode == "annotations":
+            emit_annotations(findings, args.repo_root)
+        elif args.mode == "count":
+            if args.severity != "all":
+                findings = (f for f in findings if f["severity"] == args.severity)
+            print(sum(1 for _ in findings))
+        else:
+            config = args.config or os.path.join(args.repo_root, ".clang-tidy")
+            emit_summary(findings, args.repo_root, args.server, args.repo, args.sha,
+                         args.top, disabled_checks(config), args.scope,
+                         baseline_findings(args.baseline, args.third_party_regex),
+                         args.baseline_label)
+    finally:
+        if stream is not sys.stdin:
+            stream.close()
 
 
 if __name__ == "__main__":

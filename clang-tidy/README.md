@@ -53,8 +53,10 @@ builds the project: the submodule is initialised, and the build is configured �
 analysis reads `compile_commands.json` and does not generate it.
 
 Locally `make clang-tidy` analyzes the **working tree**, which is what you are about to
-commit. CI analyzes the committed range. `make clang-tidy COMMITTED=1` reproduces the
-gate exactly; it is the only knob, and it is optional.
+commit. CI analyzes the committed range, so `make clang-tidy COMMITTED=1` reproduces what
+it looked at. Both report every finding; a consumer that blocks on only some of them
+reproduces the verdict too by adding `CLANG_TIDY_BLOCK_ON=errors`, described below. Both
+are optional, and neither is needed to see what your change introduced.
 
 ### Makefile
 
@@ -191,6 +193,40 @@ The nightly is unaffected — it never failed on findings — so the debt total 
 signal for whether an advisory gate is letting findings accumulate.
 
 Every other input has a working default; see the two workflow files for the full list.
+
+### Blocking on some findings and not others
+
+Between blocking on everything and blocking on nothing there is the useful middle: a
+project can enforce the findings that are probably defects and merely report the rest.
+
+The split is expressed as **severity**, in the consumer's own `.clang-tidy`. Listing a
+check under `WarningsAsErrors` makes clang-tidy print it as `error:` instead of
+`warning:`, so the configuration a developer already reads is the one place the tier is
+named, and this repository needs no list of check names that could fall out of step
+with it.
+
+```yaml
+# .clang-tidy in the consumer
+WarningsAsErrors: >
+  bugprone-*,
+  clang-analyzer-*
+```
+
+```yaml
+# the caller workflow
+    with:
+      fail-on-findings: true
+      block-on: errors
+```
+
+Every finding is still analyzed, annotated and summarised. Only an `error:` fails the
+job, and the annotations follow the same split: red on what blocks, yellow on what does
+not, so the two are told apart in the diff rather than in the job log.
+
+Locally, `CLANG_TIDY_BLOCK_ON=errors make clang-tidy` gives a developer the same
+verdict. A consumer that wants one command for it adds a target beside `clang-tidy`
+rather than changing it, since the unfiltered answer is the one worth having while
+writing the code.
 
 ### Files the analysis writes
 
