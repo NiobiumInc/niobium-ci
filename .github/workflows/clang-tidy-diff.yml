@@ -2,7 +2,8 @@
 #
 # Analyzes the lines a pull request changed, and nothing else: findings on untouched
 # lines of a touched file are not this change's to answer for. Whether findings block is
-# the caller's choice, not this workflow's identity.
+# the caller's choice, not this workflow's identity, and so is which of them do: see
+# fail-on-findings and block-on below.
 #
 # The analysis itself is NOT performed here. It runs through the consumer's own
 # `make clang-tidy`, which drives clang_tidy.sh from this repository checked out as a
@@ -74,6 +75,17 @@ on:
         required: false
         type: boolean
         default: true
+      block-on:
+        description: >
+          Which findings count as a failure: `findings` (all of them, the default) or
+          `errors` (only diagnostics clang-tidy printed as `error:`). A project that
+          escalates only its serious checks under WarningsAsErrors uses `errors` to
+          block on those and report the rest, and its .clang-tidy is then the single
+          place that names the tier. Ignored when fail-on-findings is false, where
+          nothing blocks either way.
+        required: false
+        type: string
+        default: 'findings'
       base-ref:
         description: 'Branch to diff against for non-pull-request events.'
         required: false
@@ -242,6 +254,11 @@ jobs:
           # The committed state is what a pull request is reviewed on; the working
           # tree is a local convenience with no meaning here.
           CLANG_TIDY_COMMITTED: '1'
+          # A caller that does not fail on findings gets `none`, which reports them
+          # without the red annotation that says the job is failing. Leniency is a
+          # property of the caller, so the analysis is told about it rather than
+          # left to assert something the caller will contradict.
+          CLANG_TIDY_BLOCK_ON: ${{ inputs.fail-on-findings && inputs.block-on || 'none' }}
           FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
         run: |
           set -uo pipefail
