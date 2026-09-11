@@ -440,17 +440,23 @@ def main():
     args = ap.parse_args()
 
     stream = sys.stdin if args.input == "-" else open(args.input, errors="replace")
-    findings = parse(stream, args.third_party_regex)
-    if args.mode == "annotations":
-        emit_annotations(findings, args.repo_root)
-    elif args.mode == "count":
-        print(sum(1 for _ in findings))
-    else:
-        config = args.config or os.path.join(args.repo_root, ".clang-tidy")
-        emit_summary(findings, args.repo_root, args.server, args.repo, args.sha,
-                     args.top, disabled_checks(config), args.scope,
-                     baseline_findings(args.baseline, args.third_party_regex),
-                     args.baseline_label)
+    try:
+        # parse() is a generator, so the file has to stay open while a mode consumes
+        # it; closing is what the process exit used to do implicitly.
+        findings = parse(stream, args.third_party_regex)
+        if args.mode == "annotations":
+            emit_annotations(findings, args.repo_root)
+        elif args.mode == "count":
+            print(sum(1 for _ in findings))
+        else:
+            config = args.config or os.path.join(args.repo_root, ".clang-tidy")
+            emit_summary(findings, args.repo_root, args.server, args.repo, args.sha,
+                         args.top, disabled_checks(config), args.scope,
+                         baseline_findings(args.baseline, args.third_party_regex),
+                         args.baseline_label)
+    finally:
+        if stream is not sys.stdin:
+            stream.close()
 
 
 if __name__ == "__main__":
