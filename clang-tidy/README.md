@@ -7,7 +7,7 @@ cannot report different things if they are the same command over the same file.
 | File | Role |
 |---|---|
 | `clang_tidy.sh` | the analysis: `check-tool`, `diff`, `all` |
-| `compile_db.py` | intersects candidate paths with `compile_commands.json` |
+| `compile_db.py` | intersects candidate paths with `compile_commands.json`; writes the copy of it, one entry per file, the analysis reads |
 | `clang_tidy_report.py` | renders annotations, a job summary, or a count |
 | `setup_clang_tidy.sh` | installs the pinned analyzer; prints its path. Handy locally too |
 
@@ -227,6 +227,49 @@ Locally, `CLANG_TIDY_BLOCK_ON=errors make clang-tidy` gives a developer the same
 verdict. A consumer that wants one command for it adds a target beside `clang-tidy`
 rather than changing it, since the unfiltered answer is the one worth having while
 writing the code.
+
+### Gating on the blocking tier alone
+
+Blocking on errors still runs every check, advisory ones included. On one consumer's
+pull request, analyzing every check took 118 s, the blocking tier alone 92 s and the
+advisory rest 35 s, on a 64-core host. Since a gate's wall time is that of its slowest
+unit, a project can gate on the blocking tier and report the rest from a second job
+that blocks nothing:
+
+```yaml
+# the caller workflow
+jobs:
+  clang-tidy:
+    uses: NiobiumInc/niobium-ci/.github/workflows/clang-tidy-diff.yml@<sha>
+    with:
+      tier: blocking
+      fail-on-findings: true
+      block-on: errors
+  clang-tidy-advisory:
+    uses: NiobiumInc/niobium-ci/.github/workflows/clang-tidy-diff.yml@<sha>
+    with:
+      tier: advisory
+      fail-on-findings: false
+```
+
+`tier` reaches `clang_tidy.sh` as `CLANG_TIDY_TIER`, and the tiers are read from the
+configuration clang-tidy resolves, so they too need no list of check names here. The
+checks it enables (`--list-checks`) are split by name: `blocking` runs those that
+`WarningsAsErrors` escalates, by clang-tidy's rule that the last glob matching a name
+decides it, and `advisory` runs every other one, a check enabled in `Checks` but
+negated in `WarningsAsErrors` included. Together the two analyze exactly what one
+`all` run does, and a configuration that escalates no enabled check has no blocking
+tier: asking for it exits 2. The compiler's own warnings are the exception to naming:
+`--list-checks` never lists a `clang-diagnostic-*` check, so `advisory` carries the
+globs of `Checks` that enable them, and a configuration that also escalates them
+cannot be split, so either tier exits 2 and the project runs `all`.
+
+### One analysis per file
+
+clang-tidy analyzes a file once for every compile command naming it, so a source built
+into several targets would be analyzed, and reported, that many times. The analysis
+reads a copy of the compile database holding the first entry for each file instead
+(`compile_db.py --dedupe-to`).
 
 ### Files the analysis writes
 

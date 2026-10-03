@@ -83,10 +83,13 @@ fake_driver() {
     cat > "$REPO/driver.py" <<'PY'
 import subprocess, sys
 binary = sys.argv[sys.argv.index("-clang-tidy-binary") + 1]
+# Forwarded the way the real driver forwards them, so a stub can see what it was given.
+forward = ["-p", sys.argv[sys.argv.index("-path") + 1]]
+forward += [a for a in sys.argv if a.startswith("-checks=")]
 files = [ln[4:].strip() for ln in sys.stdin if ln.startswith("+++ ")]
 rc = 0
 for f in files:
-    p = subprocess.run([binary, f.lstrip("b/")], capture_output=True, text=True)
+    p = subprocess.run([binary, *forward, f.lstrip("b/")], capture_output=True, text=True)
     sys.stdout.write(p.stdout); sys.stderr.write(p.stderr)
     rc = rc or p.returncode
 sys.exit(rc)
@@ -261,6 +264,140 @@ if stray=$(grep -vE ':[0-9]+:[0-9]+: (warning|error): ' clang-tidy-full.txt | gr
 else
     ok "all: the report holds diagnostics only"
 fi
+
+# --- tiers -----------------------------------------------------------------
+# The tiers come from the configuration clang-tidy resolves, so the stub answers
+# --dump-config the way clang-tidy does: its defaults first, then the project's
+# globs, and the `\n` escape a block scalar (`>`, `|`) in .clang-tidy leaves at the end.
+# --list-checks names what that configuration enables. Two cases the tiers must
+# split by name rather than by glob: bugprone-narrowing-conversions is enabled but
+# negated in WarningsAsErrors, so it is advisory; and only cert-err33-c is enabled
+# while cert-* is escalated, so it is the one cert check that blocks.
+setup; fake_driver; change_a_compiled_source
+# A stub printing the given lines as its configuration, with those enabled checks.
+tiers_stub() {
+    local name="$1"; shift
+    printf '%s\n' "$@" > "$REPO/bin/ct-$name.yaml"
+    stub "$name" "if [ \"\$1\" = --dump-config ]; then cat \"$REPO/bin/ct-$name.yaml\"; exit 0; fi
+if [ \"\$1\" = --list-checks ]; then
+  printf 'Enabled checks:\n    bugprone-empty-catch\n    bugprone-narrowing-conversions\n    cert-err33-c\n    readability-identifier-length\n\n'
+  exit 0
+fi
+printf '%s\n' \"\$*\" >> \"$REPO/args.log\"; exit 0"
+}
+CHECKS='Checks:          "clang-diagnostic-*,clang-analyzer-*,-*, bugprone-*, cert-err33-c, readability-*, -bugprone-easily-swappable-parameters\n"'
+tiers_stub tiers "$CHECKS" 'WarningsAsErrors: "bugprone-*, -bugprone-narrowing-conversions, cert-*\n"'
+export CLANG_TIDY_BIN="$REPO/bin/ct-tiers"
+
+# The -checks value a tier runs under the named stub.
+tier_run() {
+    : > args.log
+    env CLANG_TIDY_BIN="$REPO/bin/ct-$1" CLANG_TIDY_TIER="$2" bash "$SUT" diff >/dev/null 2>&1
+    grep -oE -- '-checks=[^ ]*' args.log | head -1 | cut -d= -f2-
+}
+
+: > args.log; bash "$SUT" diff >/dev/null 2>&1
+if grep -q -- '-checks=' args.log; then
+    no "tier all: the configuration runs as it is" "$(cat args.log)"
+else
+    ok "tier all: the configuration runs as it is"
+fi
+
+want='-checks=-\*,bugprone-empty-catch,cert-err33-c( |$)'
+: > args.log; env CLANG_TIDY_TIER=blocking bash "$SUT" diff >/dev/null 2>&1
+if grep -qE -- "$want" args.log; then
+    ok "tier blocking: the enabled checks WarningsAsErrors escalates, by name"
+else
+    no "tier blocking: the enabled checks WarningsAsErrors escalates, by name" "$(cat args.log)"
+fi
+
+: > args.log; env CLANG_TIDY_TIER=advisory bash "$SUT" diff >/dev/null 2>&1
+if grep -qE -- '-checks=-\*,bugprone-narrowing-conversions,readability-identifier-length( |$)' args.log; then
+    ok "tier advisory: every other enabled check, a negated escalation included"
+else
+    no "tier advisory: every other enabled check, a negated escalation included" "$(cat args.log)"
+fi
+
+: > args.log; env CLANG_TIDY_TIER=blocking bash "$SUT" all >/dev/null 2>&1
+if grep -qE -- "$want" args.log; then
+    ok "tier blocking: the survey narrows the same way"
+else
+    no "tier blocking: the survey narrows the same way" "$(cat args.log)"
+fi
+
+blocking="$(tier_run tiers blocking)"; advisory="$(tier_run tiers advisory)"
+union="$(printf '%s,%s' "${blocking#-\*,}" "${advisory#-\*,}" | tr , '\n' | sort | tr '\n' ' ')"
+if [ "$union" = "bugprone-empty-catch bugprone-narrowing-conversions cert-err33-c readability-identifier-length " ]; then
+    ok "tiers: together the enabled checks, each in one tier"
+else
+    no "tiers: together the enabled checks, each in one tier" "$union"
+fi
+
+# However --dump-config quotes the value, and however .clang-tidy separates the globs.
+for form in "plain|WarningsAsErrors: bugprone-*,-bugprone-narrowing-conversions,cert-*" \
+            "single-quoted|WarningsAsErrors: 'bugprone-*, -bugprone-narrowing-conversions, cert-*'" \
+            'newline-separated|WarningsAsErrors: "bugprone-*\n-bugprone-narrowing-conversions\ncert-*\n"'; do
+    tiers_stub form "$CHECKS" "${form#*|}"
+    got="$(tier_run form blocking)"
+    if [ "$got" = "-*,bugprone-empty-catch,cert-err33-c" ]; then
+        ok "tier blocking: WarningsAsErrors ${form%%|*}"
+    else
+        no "tier blocking: WarningsAsErrors ${form%%|*}" "$got"
+    fi
+done
+
+# --list-checks names no compiler warning, so the globs enabling them go to advisory.
+tiers_stub warnings 'Checks: "clang-diagnostic-*,-*,bugprone-*,cert-err33-c,readability-*,clang-diagnostic-unused-variable\n"' \
+    'WarningsAsErrors: "bugprone-*,-bugprone-narrowing-conversions,cert-*\n"'
+got="$(tier_run warnings advisory)"
+if [ "$got" = "-*,bugprone-narrowing-conversions,readability-identifier-length,clang-diagnostic-unused-variable" ]; then
+    ok "tier advisory: the compiler warnings Checks enables, by glob"
+else
+    no "tier advisory: the compiler warnings Checks enables, by glob" "$got"
+fi
+
+tiers_stub escalated 'Checks: "-*,bugprone-*,cert-err33-c,clang-diagnostic-*\n"' \
+    'WarningsAsErrors: "bugprone-*,-bugprone-narrowing-conversions,cert-*,clang-diagnostic-*\n"'
+expect_rc 2 "tier blocking: escalated compiler warnings cannot be split, so exit 2" \
+    env CLANG_TIDY_BIN="$REPO/bin/ct-escalated" CLANG_TIDY_TIER=blocking bash "$SUT" diff
+
+expect_rc 2 "an unrecognised tier exits 2 rather than guessing one" \
+    env CLANG_TIDY_TIER=some bash "$SUT" diff
+
+stub noescalation "if [ \"\$1\" = --dump-config ]; then echo 'Checks: \"-*,readability-*\"'; echo 'WarningsAsErrors: \"\"'; fi
+[ \"\$1\" = --list-checks ] && printf 'Enabled checks:\n    readability-identifier-length\n\n'; exit 0"
+expect_rc 2 "tier blocking: a configuration escalating nothing has no blocking tier, so exits 2" \
+    env CLANG_TIDY_BIN="$REPO/bin/ct-noescalation" CLANG_TIDY_TIER=blocking bash "$SUT" diff
+
+# --- one analysis per file --------------------------------------------------
+# A source built into two targets has two entries; clang-tidy would analyze it twice.
+setup; fake_driver; change_a_compiled_source
+python3 - "$REPO/build/compile_commands.json" <<'PY'
+import json, sys
+db = json.load(open(sys.argv[1]))
+db.append(dict(db[0], command="c++ -c a -DOTHER_TARGET"))
+json.dump(db, open(sys.argv[1], "w"))
+PY
+stub entries "db=\"\${2}/compile_commands.json\"; f=\"\${!#}\"
+python3 -c 'import json,os,sys; print(sum(os.path.basename(e[\"file\"]) == os.path.basename(sys.argv[2]) for e in json.load(open(sys.argv[1]))))' \"\$db\" \"\$f\" >> \"$REPO/entries.log\"; exit 0"
+export CLANG_TIDY_BIN="$REPO/bin/ct-entries"
+: > entries.log; bash "$SUT" diff >/dev/null 2>&1
+if [ "$(sort -u entries.log)" = "1" ]; then
+    ok "diff: a source with two compile commands is analyzed against one"
+else
+    no "diff: a source with two compile commands is analyzed against one" "entries seen: $(tr '\n' ' ' < entries.log)"
+fi
+: > entries.log; bash "$SUT" all >/dev/null 2>&1
+if [ "$(sort -u entries.log)" = "1" ]; then
+    ok "all: a source with two compile commands is analyzed against one"
+else
+    no "all: a source with two compile commands is analyzed against one" "entries seen: $(tr '\n' ' ' < entries.log)"
+fi
+
+# A TMPDIR swept away under a runner slot fails mktemp; analyzing on with no
+# compile database would be a verdict over nothing.
+expect_rc 2 "diff: a TMPDIR that cannot hold the deduplicated database exits 2" \
+    env TMPDIR="$REPO/no-such-dir" bash "$SUT" diff
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

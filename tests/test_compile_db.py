@@ -94,5 +94,52 @@ class CommandLine(unittest.TestCase):
         self.assertEqual(self.run_cli([]), [])
 
 
+class Dedupe(unittest.TestCase):
+    """--dedupe-to keeps one entry per file, so clang-tidy analyzes each file once."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.out = os.path.join(self.root, "dedup")
+
+    def run_dedupe(self, entries):
+        db = os.path.join(self.root, "compile_commands.json")
+        with open(db, "w") as fh:
+            json.dump(entries, fh)
+        subprocess.run([sys.executable, SCRIPT, "--db", db, "--dedupe-to", self.out],
+                       check=True, capture_output=True)
+        with open(os.path.join(self.out, "compile_commands.json")) as fh:
+            return json.load(fh)
+
+    def test_the_first_entry_for_a_file_is_kept(self):
+        got = self.run_dedupe([
+            {"directory": self.root, "file": f"{self.root}/src/a.cpp", "command": "first"},
+            {"directory": self.root, "file": f"{self.root}/src/b.cpp", "command": "b"},
+            {"directory": self.root, "file": f"{self.root}/src/a.cpp", "command": "second"},
+        ])
+        self.assertEqual([e["command"] for e in got], ["first", "b"])
+
+    def test_one_file_named_two_ways_is_one_file(self):
+        # A relative `file` resolves against its own `directory`, as the spec says.
+        got = self.run_dedupe([
+            {"directory": self.root, "file": f"{self.root}/src/a.cpp", "command": "abs"},
+            {"directory": os.path.join(self.root, "build"), "file": "../src/a.cpp", "command": "rel"},
+        ])
+        self.assertEqual([e["command"] for e in got], ["abs"])
+
+    def test_entries_are_otherwise_untouched(self):
+        entry = {"directory": self.root, "file": "src/a.cpp", "arguments": ["c++", "-c", "a"]}
+        self.assertEqual(self.run_dedupe([entry]), [entry])
+
+    def test_an_empty_directory_is_an_error_not_the_filter(self):
+        # A caller whose mktemp failed passes ""; falling through to the stdin
+        # filter would exit 0 and leave no database behind.
+        db = os.path.join(self.root, "compile_commands.json")
+        with open(db, "w") as fh:
+            json.dump([], fh)
+        res = subprocess.run([sys.executable, SCRIPT, "--db", db, "--dedupe-to", ""],
+                             input="", capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
