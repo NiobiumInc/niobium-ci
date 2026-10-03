@@ -27,6 +27,14 @@
 #             blocking tier is named there, so this script needs no list of checks
 #             and cannot disagree with the configuration a developer reads.
 #   none      none of them; the caller reports findings without acting on them.
+#
+# CLANG_TIDY_TIER says which of the project's checks run, again read from its own
+# .clang-tidy rather than listed here:
+#   all       every check it enables. The default.
+#   blocking  only those it escalates under WarningsAsErrors: the checks that can
+#             fail a pull request, so a gate need not wait for the rest.
+#   advisory  every check it enables but those, so that a blocking and an advisory
+#             run together cover what one `all` run does, without analyzing twice.
 set -uo pipefail
 
 MODE="${1:?usage: clang_tidy.sh check-tool|diff|all}"
@@ -38,6 +46,7 @@ HELPERS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${CLANG_TIDY_BIN:=clang-tidy}"
 : "${CLANG_TIDY_COMMITTED:=0}"
 : "${CLANG_TIDY_BLOCK_ON:=findings}"
+: "${CLANG_TIDY_TIER:=all}"
 CLANG_TIDY_BASE="${CLANG_TIDY_BASE:-}"
 DB="$CLANG_TIDY_BUILD_DIR/compile_commands.json"
 STATUS_FILE="clang-tidy-status.txt"
@@ -63,6 +72,11 @@ readonly EX_FINDINGS=1 EX_NOVERDICT=2
 case "$CLANG_TIDY_BLOCK_ON" in
     findings|errors|none) ;;
     *) err "CLANG_TIDY_BLOCK_ON must be findings, errors or none, not '$CLANG_TIDY_BLOCK_ON'."
+       exit "$EX_NOVERDICT" ;;
+esac
+case "$CLANG_TIDY_TIER" in
+    all|blocking|advisory) ;;
+    *) err "CLANG_TIDY_TIER must be all, blocking or advisory, not '$CLANG_TIDY_TIER'."
        exit "$EX_NOVERDICT" ;;
 esac
 
@@ -171,6 +185,88 @@ toolchain_args() {
 }
 
 # --------------------------------------------------------------------------
+# The --checks value that narrows the project's configuration to CLANG_TIDY_TIER,
+# empty for `all`: everything off, then the tier's checks by name. The checks the
+# configuration enables (--list-checks) are split by WarningsAsErrors, read with
+# clang-tidy's own rule that the last glob matching a name decides it:
+#   blocking  the enabled checks it escalates.
+#   advisory  every other enabled check, a negated escalation included.
+# So the two partition what `all` runs, and both are read from the configuration
+# clang-tidy itself resolves, so the tiers cannot drift from .clang-tidy.
+# --list-checks never names the compiler's own warnings, so advisory carries the
+# clang-diagnostic-* globs of Checks as globs, and escalating any of them has no tier.
+# --------------------------------------------------------------------------
+tier_checks() {
+    [ "$CLANG_TIDY_TIER" = all ] && return 0
+    local enabled
+    enabled="$("$CLANG_TIDY_BIN" --list-checks)" || return 1
+    "$CLANG_TIDY_BIN" --dump-config | ENABLED="$enabled" TIER="$CLANG_TIDY_TIER" python3 -c '
+import json, os, re, sys
+# A value is a YAML scalar. A block scalar in .clang-tidy (> or |) keeps its
+# final newline, which --dump-config writes as a backslash-n escape inside
+# double quotes: decoded, it is whitespace, and stripping a glob drops it.
+def scalar(value):
+    value = value.strip()
+    if value.startswith("\""):
+        return json.loads(value)
+    if value.startswith("\x27"):
+        return value[1:-1].replace("\x27\x27", "\x27")
+    return value
+# Globs are separated by commas or newlines, as clang-tidy reads them.
+def globs(value):
+    return [g.strip() for g in re.split(r"[,\n]", scalar(value)) if g.strip()]
+config = {"Checks": [], "WarningsAsErrors": []}
+for line in sys.stdin:
+    m = re.match(r"^(Checks|WarningsAsErrors):\s*(.*)$", line)
+    if m:
+        config[m.group(1)] = globs(m.group(2))
+escalated = config["WarningsAsErrors"]
+def escalates(name):
+    decided = False
+    for glob in escalated:
+        negated = glob.startswith("-")
+        pattern = ".*".join(map(re.escape, glob.lstrip("-").split("*")))
+        if re.fullmatch(pattern, name):
+            decided = not negated
+    return decided
+# The globs that reach a compiler warning, those like -* written in its terms, from
+# the last that switches every one off: what is left is what the list enables.
+DIAGNOSTIC = "clang-diagnostic-"
+def diagnostics(globs):
+    kept = []
+    for glob in globs:
+        sign, pattern = ("-", glob[1:]) if glob.startswith("-") else ("", glob)
+        if pattern.endswith("*") and DIAGNOSTIC.startswith(pattern[:-1]):
+            pattern = DIAGNOSTIC + "*"
+        elif not pattern.startswith(DIAGNOSTIC):
+            continue
+        kept = [] if sign + pattern == "-" + DIAGNOSTIC + "*" else kept + [sign + pattern]
+    return kept if any(not g.startswith("-") for g in kept) else []
+warnings = diagnostics(config["Checks"])
+if warnings and diagnostics(escalated):
+    sys.exit("WarningsAsErrors escalates compiler warnings, which --list-checks cannot name, so they have no tier: run all")
+enabled = [ln.strip() for ln in os.environ["ENABLED"].splitlines() if ln.startswith(" ") and ln.strip()]
+blocking = [name for name in enabled if escalates(name)]
+if not blocking:
+    sys.exit("no enabled check is escalated under WarningsAsErrors, so there is no blocking tier")
+blocked = set(blocking)
+tier = blocking if os.environ["TIER"] == "blocking" else [n for n in enabled if n not in blocked] + warnings
+print(",".join(["-*"] + tier))
+'
+}
+
+# --------------------------------------------------------------------------
+# clang-tidy analyzes a file once for every compile command naming it, so a source
+# built into several targets is analyzed, and reported, that many times. Analysis
+# reads a copy of the database with one entry per file instead.
+# --------------------------------------------------------------------------
+dedupe_db() {
+    # Going on after a failed mktemp would hand clang-tidy an empty -p.
+    ANALYSIS_DB="$(mktemp -d -t nb-clang-tidy-db.XXXXXX)" || return 1
+    python3 "$HELPERS/compile_db.py" --db "$DB" --dedupe-to "$ANALYSIS_DB"
+}
+
+# --------------------------------------------------------------------------
 # There are findings. What they mean is the caller's policy, so say it the way that
 # caller will act on it rather than asserting one answer for every consumer.
 #
@@ -245,11 +341,12 @@ lint_diff() {
     local -a extra=()
     local arg
     while IFS= read -r arg; do extra+=("-extra-arg-before=$arg"); done < <(toolchain_args)
+    [ -n "$CHECKS" ] && extra+=("-checks=$CHECKS")
 
     git diff -U0 "${range[@]}" -- "${tus[@]}" \
         | python3 "$driver" \
             -clang-tidy-binary "$CLANG_TIDY_BIN" \
-            -p1 -path "$CLANG_TIDY_BUILD_DIR" -j "$(nproc)" \
+            -p1 -path "$ANALYSIS_DB" -j "$(nproc)" \
             "${extra[@]}" \
             2> clang-tidy-stderr.txt \
         | tee clang-tidy-report.txt
@@ -329,7 +426,7 @@ lint_all() {
 #!/usr/bin/env bash
 f="$1"
 out="$OUTDIR/$(printf '%s' "$f" | tr / _).txt"
-"$CLANG_TIDY_BIN" -p "$CLANG_TIDY_BUILD_DIR" --quiet \
+"$CLANG_TIDY_BIN" -p "$ANALYSIS_DB" --quiet ${CHECKS:+"--checks=$CHECKS"} \
     ${ARG1:+"--extra-arg-before=$ARG1"} ${ARG2:+"--extra-arg-before=$ARG2"} \
     "$f" > "$out" 2>&1
 rc=$?
@@ -340,7 +437,7 @@ exit 0
 SH
     chmod +x "$outdir/one.sh"
     OUTDIR="$unitdir" CRASHES="$crashes" ARG1="${arg1:-}" ARG2="${arg2:-}" \
-    CLANG_TIDY_BIN="$CLANG_TIDY_BIN" CLANG_TIDY_BUILD_DIR="$CLANG_TIDY_BUILD_DIR" \
+    CLANG_TIDY_BIN="$CLANG_TIDY_BIN" ANALYSIS_DB="$ANALYSIS_DB" CHECKS="$CHECKS" \
         xargs -a "$outdir/files.txt" -P "$(nproc)" -I{} "$outdir/one.sh" {} || true
 
     cat "$unitdir"/*.txt > clang-tidy-full.txt 2>/dev/null
@@ -363,14 +460,26 @@ SH
     rm -rf "$outdir"
 }
 
+# What both analyzing modes need before they start: the tier's checks and the
+# deduplicated database. Failing either means there is no verdict to give.
+prepare() {
+    if ! CHECKS="$(tier_checks)"; then
+        err "cannot narrow the analysis to the $CLANG_TIDY_TIER tier."
+        return 1
+    fi
+    dedupe_db || { err "cannot write a deduplicated copy of $DB."; return 1; }
+    [ -n "$CHECKS" ] && echo "tier $CLANG_TIDY_TIER: -checks=$CHECKS"
+    return 0
+}
+
 run_mode() {
     case "$MODE" in
         check-tool) check_tool || return "$EX_NOVERDICT" ;;
         # The pre-flight checks mean the analysis did not run, so they report 2 rather
         # than falling through as if the code were clean.
-        diff)       check_tool && check_scope && check_compile_db || return "$EX_NOVERDICT"
+        diff)       check_tool && check_scope && check_compile_db && prepare || return "$EX_NOVERDICT"
                     lint_diff ;;
-        all)        check_tool && check_scope && check_compile_db || return "$EX_NOVERDICT"
+        all)        check_tool && check_scope && check_compile_db && prepare || return "$EX_NOVERDICT"
                     lint_all ;;
         *)          err "unknown mode: $MODE"; return "$EX_NOVERDICT" ;;
     esac
@@ -378,8 +487,11 @@ run_mode() {
 
 # Removed first, so a status left by an earlier run cannot be read as this one's.
 rm -f "$STATUS_FILE"
+CHECKS=""
+ANALYSIS_DB=""
 run_mode
 rc=$?
+[ -n "$ANALYSIS_DB" ] && rm -rf "$ANALYSIS_DB"
 
 # --------------------------------------------------------------------------
 # The contract above is worth nothing to a caller that reaches this through `make`:
