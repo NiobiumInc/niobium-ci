@@ -183,6 +183,13 @@ build must do its cloning early, which a compile-database build does. A plain `t
 secret still works and is used when no App is passed. Prefer the App: a personal or
 long-lived token is whatever its owner can do, for as long as nobody revokes it.
 
+By default the App token reads every repository the App is installed on. Name the ones
+the build clones in `app-repositories` to narrow it: bare names, one per line, private
+and internal ones only, since public ones clone without a token. The caller's own
+repository is added for you. A repository left out fails its clone with "Repository
+not found", so check that the build reports a failed submodule as a failure: one that
+only warns would let a missing nested submodule pass unnoticed.
+
 ### Reporting without blocking
 
 A gate that is routinely overridden protects nothing, so it can be made advisory:
