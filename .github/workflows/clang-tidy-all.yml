@@ -75,6 +75,15 @@ on:
     secrets:
       token:
         required: false
+      app-id:
+        description: >
+          ID of a GitHub App installed on the organization. With app-private-key, the
+          workflow mints a one-hour installation token with contents:read and uses it
+          wherever `token` would be used; it takes precedence over `token`.
+        required: false
+      app-private-key:
+        description: 'Private key of the GitHub App named by app-id.'
+        required: false
     outputs:
       findings-count:
         description: 'Findings across all analyzed translation units.'
@@ -96,11 +105,26 @@ jobs:
     outputs:
       findings-count: ${{ steps.render.outputs.count }}
       unscoped-count: ${{ steps.render.outputs.unscoped }}
+    env:
+      # `secrets` is not available in a step's `if:`, so the choice is made here.
+      USE_APP_TOKEN: ${{ secrets.app-id != '' && secrets.app-private-key != '' }}
     steps:
+      # An App installation token lasts an hour and carries only contents:read, where a
+      # personal or long-lived token is whatever its owner can do and never expires.
+      - name: Mint App token
+        id: app-token
+        if: env.USE_APP_TOKEN == 'true'
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.app-id }}
+          private-key: ${{ secrets.app-private-key }}
+          owner: ${{ github.repository_owner }}
+          permission-contents: read
+
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          token: ${{ secrets.token || github.token }}
+          token: ${{ steps.app-token.outputs.token || secrets.token || github.token }}
 
       # See the note in clang-tidy-diff.yml: only this submodule, and it is public.
       - name: Initialize shared CI submodule
@@ -151,7 +175,7 @@ jobs:
       - name: Build compile database
         env:
           BUILD_COMMAND: ${{ inputs.build-command }}
-          GH_TOKEN: ${{ secrets.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.token }}
         run: |
           set -euo pipefail
           eval "$BUILD_COMMAND"

@@ -137,7 +137,8 @@ jobs:
       runs-on: '["self-hosted","your-runner-label"]'
       build-command: bash .github/scripts/build-compile-db.sh
     secrets:
-      token: ${{ secrets.YOUR_ORG_TOKEN }}
+      app-id: ${{ secrets.APP_ID }}
+      app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
 ```
 
 ```yaml
@@ -153,7 +154,8 @@ jobs:
       runs-on: '["self-hosted","your-runner-label"]'
       build-command: bash .github/scripts/build-compile-db.sh
     secrets:
-      token: ${{ secrets.YOUR_ORG_TOKEN }}
+      app-id: ${{ secrets.APP_ID }}
+      app-private-key: ${{ secrets.APP_PRIVATE_KEY }}
 ```
 
 Pin by commit SHA. These workflows reference nothing in `niobium-ci` by tag — the
@@ -173,6 +175,13 @@ invokes it.
 `build-command` is the consumer's own. Everything the build needs, submodule fetching
 included, belongs there: it stays private, and the token reaches it as `$GH_TOKEN` from
 the one step that legitimately holds a secret.
+
+The token comes from one of two places. With `app-id` and `app-private-key`, the
+workflow mints a GitHub App installation token at the start of the job: it carries only
+`contents: read` on the organization's repositories and expires after an hour, so the
+build must do its cloning early, which a compile-database build does. A plain `token`
+secret still works and is used when no App is passed. Prefer the App: a personal or
+long-lived token is whatever its owner can do, for as long as nobody revokes it.
 
 ### Reporting without blocking
 
