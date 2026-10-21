@@ -104,6 +104,9 @@ change_a_compiled_source() {
 
 echo "clang_tidy.sh"
 
+# Every `all` run is under a timeout: it starts a background progress loop, and a
+# regression that never stops it would hang the suite rather than fail it.
+
 # --- the exit-code contract ------------------------------------------------
 setup; fake_driver; change_a_compiled_source
 CLANG_TIDY_BIN="$REPO/bin/ct-clean"  expect_rc 0 "diff: clean run exits 0" bash "$SUT" diff
@@ -223,13 +226,13 @@ setup
 export CLANG_TIDY_BIN="$REPO/bin/ct-clean"
 expect_out "analyzing 2 translation units" \
     "all: analyzes in-scope compiled units only — not the test, the tooling or the uncompiled source" \
-    bash "$SUT" all
+    timeout 30 bash "$SUT" all
 expect_out "2 compiled tracked unit\(s\) outside scope" \
-    "all: reports what the scope leaves out" bash "$SUT" all
+    "all: reports what the scope leaves out" timeout 30 bash "$SUT" all
 
 setup
 export CLANG_TIDY_BIN="$REPO/bin/ct-clean"
-bash "$SUT" all >/dev/null 2>&1
+timeout 30 bash "$SUT" all >/dev/null 2>&1
 if grep -qE 'replay/tests/t\.cpp' clang-tidy-unscoped.txt && grep -qE 'tools/u\.cpp' clang-tidy-unscoped.txt; then
     ok "all: names the excluded units"
 else
@@ -237,17 +240,46 @@ else
 fi
 
 # A survey is about an hour: while the units run, the log must say how far it is.
+# The units take different times (a.cpp 0.2 s, b.cpp 4 s), so a tick between them
+# must count one as done: a count stuck at 0 is a broken count, not progress.
+# Every run here is under `timeout 30`: a loop that is never stopped would
+# otherwise hang the suite rather than fail it.
 setup
-stub slow 'sleep 1; exit 0'
-export CLANG_TIDY_BIN="$REPO/bin/ct-slow"
-expect_out "clang-tidy: [0-9]+/2 translation units analyzed" \
-    "all: reports progress while the units run" env CLANG_TIDY_PROGRESS_S=0.3 bash "$SUT" all
-out="$(CLANG_TIDY_PROGRESS_S=0.3 bash "$SUT" all 2>&1)"
-if [ -f clang-tidy-full.txt ] && ! grep -q 'translation units analyzed' clang-tidy-full.txt \
-        && [ "$(grep -c 'translation units analyzed' <<<"$out")" -lt 20 ]; then
+stub uneven 'case "$*" in *b.cpp*) sleep 4 ;; *) sleep 0.2 ;; esac; exit 0'
+export CLANG_TIDY_BIN="$REPO/bin/ct-uneven"
+expect_out "clang-tidy: 1/2 translation units analyzed" \
+    "all: reports progress while the units run, counting the finished ones" \
+    timeout 30 env CLANG_TIDY_PROGRESS_S=1 bash "$SUT" all
+out="$(timeout 30 env CLANG_TIDY_PROGRESS_S=1 bash "$SUT" all 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && [ -f clang-tidy-full.txt ] && ! grep -q 'translation units analyzed' clang-tidy-full.txt \
+        && [ "$(grep -c 'translation units analyzed' <<<"$out")" -lt 10 ]; then
     ok "all: progress goes to the log, not into the report, and stops with the run"
 else
-    no "all: progress goes to the log, not into the report, and stops with the run" "$out"
+    no "all: progress goes to the log, not into the report, and stops with the run" "rc=$rc: $out"
+fi
+out="$(timeout 30 env CLANG_TIDY_PROGRESS_S=0 bash "$SUT" all 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && ! grep -q 'translation units analyzed' <<<"$out"; then
+    ok "all: CLANG_TIDY_PROGRESS_S=0 turns progress off"
+else
+    no "all: CLANG_TIDY_PROGRESS_S=0 turns progress off" "rc=$rc: $(head -5 <<<"$out")"
+fi
+out="$(timeout 30 env CLANG_TIDY_PROGRESS_S=0.001 bash "$SUT" all 2>&1)"
+if [ "$(grep -c 'translation units analyzed' <<<"$out")" -lt 10 ]; then
+    ok "all: an interval under a second is raised to one, not a busy loop"
+else
+    no "all: an interval under a second is raised to one, not a busy loop" \
+        "$(grep -c 'translation units analyzed' <<<"$out") progress lines in 4 s"
+fi
+# Killed from outside, the script's PID alone (not its process group, as GNU
+# timeout would): the loop must end with the script, not go on printing.
+CLANG_TIDY_PROGRESS_S=1 bash "$SUT" all > killed.out 2>&1 &
+victim=$!
+sleep 2; kill "$victim"; wait "$victim" 2>/dev/null
+sleep 0.5; before=$(wc -l < killed.out); sleep 2.5; after=$(wc -l < killed.out)
+if [ "$before" -eq "$after" ]; then
+    ok "all: a killed run leaves no progress loop printing"
+else
+    no "all: a killed run leaves no progress loop printing" "$before -> $after lines after the kill"
 fi
 
 # The loop's sleep must not hold the script's stdout once the run is over: a
@@ -255,7 +287,7 @@ fi
 setup
 export CLANG_TIDY_BIN="$REPO/bin/ct-clean"
 start=$SECONDS
-CLANG_TIDY_PROGRESS_S=8 bash "$SUT" all 2>&1 | cat >/dev/null
+timeout 30 env CLANG_TIDY_PROGRESS_S=8 bash "$SUT" all 2>&1 | cat >/dev/null
 if [ $((SECONDS - start)) -lt 5 ]; then
     ok "all: a piped reader gets EOF when the run ends, not when the progress sleep does"
 else
@@ -266,7 +298,7 @@ fi
 setup
 export CLANG_TIDY_BIN="$REPO/bin/ct-clean"
 echo "src/gone.cpp" > clang-tidy-crashes.txt
-bash "$SUT" all >/dev/null 2>&1
+timeout 30 bash "$SUT" all >/dev/null 2>&1
 if [ -f clang-tidy-crashes.txt ]; then
     no "all: a stale crash list does not survive a clean run" "the file is still there"
 else
@@ -275,13 +307,13 @@ fi
 
 setup
 export CLANG_TIDY_BIN="$REPO/bin/ct-crash"
-expect_rc 2 "all: a crashed unit fails the survey — its totals would understate the debt" bash "$SUT" all
+expect_rc 2 "all: a crashed unit fails the survey — its totals would understate the debt" timeout 30 bash "$SUT" all
 if [ -s clang-tidy-crashes.txt ]; then ok "all: a real crash is recorded"; else no "all: a real crash is recorded" "empty"; fi
 
 # --- the report is only diagnostics ----------------------------------------
 setup
 export CLANG_TIDY_BIN="$REPO/bin/ct-find"
-bash "$SUT" all >/dev/null 2>&1
+timeout 30 bash "$SUT" all >/dev/null 2>&1
 # Every line must be a diagnostic. The file lists of units and of excluded paths are
 # *.txt too, and a flat working directory would let them be concatenated in here,
 # where they parse as nothing and quietly pad the artifact.
@@ -344,7 +376,7 @@ else
     no "tier advisory: every other enabled check, a negated escalation included" "$(cat args.log)"
 fi
 
-: > args.log; env CLANG_TIDY_TIER=blocking bash "$SUT" all >/dev/null 2>&1
+: > args.log; env CLANG_TIDY_TIER=blocking timeout 30 bash "$SUT" all >/dev/null 2>&1
 if grep -qE -- "$want" args.log; then
     ok "tier blocking: the survey narrows the same way"
 else
@@ -413,7 +445,7 @@ if [ "$(sort -u entries.log)" = "1" ]; then
 else
     no "diff: a source with two compile commands is analyzed against one" "entries seen: $(tr '\n' ' ' < entries.log)"
 fi
-: > entries.log; bash "$SUT" all >/dev/null 2>&1
+: > entries.log; timeout 30 bash "$SUT" all >/dev/null 2>&1
 if [ "$(sort -u entries.log)" = "1" ]; then
     ok "all: a source with two compile commands is analyzed against one"
 else

@@ -56,6 +56,10 @@ jobs:
   tests:
     name: tests
     runs-on: ubuntu-latest
+    # The suite takes about a minute. A regression that leaves a background loop or
+    # a wait behind would otherwise hang it for GitHub's six-hour default instead
+    # of failing.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
