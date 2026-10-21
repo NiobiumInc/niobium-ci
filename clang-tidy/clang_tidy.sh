@@ -433,12 +433,49 @@ rc=$?
 if [ "$rc" -ge 128 ] || grep -qE 'PLEASE submit a bug report|Stack dump:' "$out"; then
     printf '%s\n' "$f" >> "$CRASHES"
 fi
+printf '%s\n' "$f" >> "$DONE"
 exit 0
 SH
     chmod +x "$outdir/one.sh"
-    OUTDIR="$unitdir" CRASHES="$crashes" ARG1="${arg1:-}" ARG2="${arg2:-}" \
+
+    # A count of finished units every CLANG_TIDY_PROGRESS_S seconds while they run:
+    # the whole survey is about an hour on a CI node, and a log streamed into a CI
+    # job as it runs would otherwise say nothing between the line above and the
+    # end. Each unit appends one short line on finishing, which O_APPEND keeps whole
+    # across the parallel children.
+    #
+    # 0 turns it off. Anything else under a second is raised to one: `sleep 0`
+    # returns at once, so a zero interval would be a busy loop printing millions of
+    # lines over the survey. A value that is not a number is the default.
+    local done_list="$outdir/done.txt" interval="${CLANG_TIDY_PROGRESS_S:-60}" progress=""
+    : > "$done_list"
+    if [[ ! "$interval" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "note: CLANG_TIDY_PROGRESS_S='$interval' is not a number of seconds; using 60" >&2
+        interval=60
+    elif [[ "$interval" =~ ^0+([.]0+)?$ ]]; then
+        interval=0
+    elif [[ "$interval" =~ ^0*[.] ]]; then
+        interval=1
+    fi
+    if [ "$interval" != 0 ]; then
+        # The sleep holds nothing: killing the loop leaves it running out its
+        # interval, and holding stdout it would keep a piped reader waiting that
+        # long for EOF. The EXIT trap stops the loop if the script itself is killed
+        # (a timeout around it) rather than leave it printing.
+        ( while sleep "$interval" >/dev/null 2>&1; do
+              echo "clang-tidy: $(wc -l < "$done_list")/$total translation units analyzed"
+          done ) &
+        progress=$!
+        trap 'kill "$progress" 2>/dev/null' EXIT
+    fi
+    OUTDIR="$unitdir" CRASHES="$crashes" DONE="$done_list" ARG1="${arg1:-}" ARG2="${arg2:-}" \
     CLANG_TIDY_BIN="$CLANG_TIDY_BIN" ANALYSIS_DB="$ANALYSIS_DB" CHECKS="$CHECKS" \
         xargs -a "$outdir/files.txt" -P "$(nproc)" -I{} "$outdir/one.sh" {} || true
+    if [ -n "$progress" ]; then
+        kill "$progress" 2>/dev/null
+        wait "$progress" 2>/dev/null
+        trap - EXIT
+    fi
 
     cat "$unitdir"/*.txt > clang-tidy-full.txt 2>/dev/null
     echo "$(wc -l < clang-tidy-full.txt) lines of output"
