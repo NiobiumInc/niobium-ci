@@ -445,7 +445,9 @@ SH
     # across the parallel children.
     local done_list="$outdir/done.txt" progress
     : > "$done_list"
-    ( while sleep "${CLANG_TIDY_PROGRESS_S:-60}"; do
+    # The sleep holds nothing: killing the loop leaves it running out its interval,
+    # and holding stdout it would keep a piped reader waiting that long for EOF.
+    ( while sleep "${CLANG_TIDY_PROGRESS_S:-60}" >/dev/null 2>&1; do
           echo "clang-tidy: $(wc -l < "$done_list")/$total translation units analyzed"
       done ) &
     progress=$!

@@ -250,6 +250,18 @@ else
     no "all: progress goes to the log, not into the report, and stops with the run" "$out"
 fi
 
+# The loop's sleep must not hold the script's stdout once the run is over: a
+# piped reader would wait out the rest of the interval for EOF.
+setup
+export CLANG_TIDY_BIN="$REPO/bin/ct-clean"
+start=$SECONDS
+CLANG_TIDY_PROGRESS_S=8 bash "$SUT" all 2>&1 | cat >/dev/null
+if [ $((SECONDS - start)) -lt 5 ]; then
+    ok "all: a piped reader gets EOF when the run ends, not when the progress sleep does"
+else
+    no "all: a piped reader gets EOF when the run ends, not when the progress sleep does" "took $((SECONDS - start)) s"
+fi
+
 # --- state that must not survive a run -------------------------------------
 setup
 export CLANG_TIDY_BIN="$REPO/bin/ct-clean"
