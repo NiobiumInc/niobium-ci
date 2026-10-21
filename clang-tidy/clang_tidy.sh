@@ -433,12 +433,27 @@ rc=$?
 if [ "$rc" -ge 128 ] || grep -qE 'PLEASE submit a bug report|Stack dump:' "$out"; then
     printf '%s\n' "$f" >> "$CRASHES"
 fi
+printf '%s\n' "$f" >> "$DONE"
 exit 0
 SH
     chmod +x "$outdir/one.sh"
-    OUTDIR="$unitdir" CRASHES="$crashes" ARG1="${arg1:-}" ARG2="${arg2:-}" \
+
+    # A count of finished units every CLANG_TIDY_PROGRESS_S seconds while they run:
+    # the whole survey is about an hour on a CI node, and a log streamed into a CI
+    # job as it runs would otherwise say nothing between the line above and the
+    # end. Each unit appends one short line on finishing, which O_APPEND keeps whole
+    # across the parallel children.
+    local done_list="$outdir/done.txt" progress
+    : > "$done_list"
+    ( while sleep "${CLANG_TIDY_PROGRESS_S:-60}"; do
+          echo "clang-tidy: $(wc -l < "$done_list")/$total translation units analyzed"
+      done ) &
+    progress=$!
+    OUTDIR="$unitdir" CRASHES="$crashes" DONE="$done_list" ARG1="${arg1:-}" ARG2="${arg2:-}" \
     CLANG_TIDY_BIN="$CLANG_TIDY_BIN" ANALYSIS_DB="$ANALYSIS_DB" CHECKS="$CHECKS" \
         xargs -a "$outdir/files.txt" -P "$(nproc)" -I{} "$outdir/one.sh" {} || true
+    kill "$progress" 2>/dev/null
+    wait "$progress" 2>/dev/null
 
     cat "$unitdir"/*.txt > clang-tidy-full.txt 2>/dev/null
     echo "$(wc -l < clang-tidy-full.txt) lines of output"

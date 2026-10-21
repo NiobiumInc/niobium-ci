@@ -236,6 +236,20 @@ else
     no "all: names the excluded units" "$(cat clang-tidy-unscoped.txt)"
 fi
 
+# A survey is about an hour: while the units run, the log must say how far it is.
+setup
+stub slow 'sleep 1; exit 0'
+export CLANG_TIDY_BIN="$REPO/bin/ct-slow"
+expect_out "clang-tidy: [0-9]+/2 translation units analyzed" \
+    "all: reports progress while the units run" env CLANG_TIDY_PROGRESS_S=0.3 bash "$SUT" all
+out="$(CLANG_TIDY_PROGRESS_S=0.3 bash "$SUT" all 2>&1)"
+if [ -f clang-tidy-full.txt ] && ! grep -q 'translation units analyzed' clang-tidy-full.txt \
+        && [ "$(grep -c 'translation units analyzed' <<<"$out")" -lt 20 ]; then
+    ok "all: progress goes to the log, not into the report, and stops with the run"
+else
+    no "all: progress goes to the log, not into the report, and stops with the run" "$out"
+fi
+
 # --- state that must not survive a run -------------------------------------
 setup
 export CLANG_TIDY_BIN="$REPO/bin/ct-clean"
