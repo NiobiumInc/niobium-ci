@@ -86,10 +86,13 @@ binary = sys.argv[sys.argv.index("-clang-tidy-binary") + 1]
 # Forwarded the way the real driver forwards them, so a stub can see what it was given.
 forward = ["-p", sys.argv[sys.argv.index("-path") + 1]]
 forward += [a for a in sys.argv if a.startswith("-checks=")]
+# -pN strips N leading path components, as the real driver's -p does: `+++ b/src/a.cpp`
+# under -p1 is src/a.cpp, and an unprefixed `+++ src/a.cpp` would be a.cpp.
+strip = next((int(a[2:]) for a in sys.argv if a[:2] == "-p" and a[2:].isdigit()), 0)
 files = [ln[4:].strip() for ln in sys.stdin if ln.startswith("+++ ")]
 rc = 0
 for f in files:
-    p = subprocess.run([binary, *forward, f.lstrip("b/")], capture_output=True, text=True)
+    p = subprocess.run([binary, *forward, "/".join(f.split("/")[strip:])], capture_output=True, text=True)
     sys.stdout.write(p.stdout); sys.stderr.write(p.stderr)
     rc = rc or p.returncode
 sys.exit(rc)
@@ -111,6 +114,13 @@ echo "clang_tidy.sh"
 setup; fake_driver; change_a_compiled_source
 CLANG_TIDY_BIN="$REPO/bin/ct-clean"  expect_rc 0 "diff: clean run exits 0" bash "$SUT" diff
 CLANG_TIDY_BIN="$REPO/bin/ct-find"   expect_rc 1 "diff: findings exit 1, the only downgradable status" bash "$SUT" diff
+# The git path's patch keeps git's default prefixes whatever the user's config: under
+# diff.noprefix an unpinned `+++ src/a.cpp` reaches the analyzer as a.cpp, after -p1.
+# This analyzer reports only on the file it was given, and fails on one that is not there.
+# shellcheck disable=SC2016  # expanded when the stub runs, not here
+stub seen 'f="${!#}"; [ -f "$f" ] || { echo "no such file: $f" >&2; exit 3; }; echo "$PWD/$f:2:1: warning: found [modernize-use-auto]"; exit 1'
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.noprefix GIT_CONFIG_VALUE_0=true CLANG_TIDY_BIN="$REPO/bin/ct-seen" \
+    expect_rc 1 "diff: the analyzer gets the changed file's path whatever the diff config" bash "$SUT" diff
 CLANG_TIDY_BIN="$REPO/bin/ct-crash"  expect_rc 2 "diff: a crash exits 2, never 1" bash "$SUT" diff
 CLANG_TIDY_BIN="$REPO/bin/ct-oldver" expect_rc 2 "diff: wrong analyzer version exits 2" bash "$SUT" diff
 CLANG_TIDY_BIN="$REPO/bin/ct-oldver" expect_rc 2 "check-tool: wrong version exits 2, not 1" bash "$SUT" check-tool
