@@ -86,10 +86,13 @@ binary = sys.argv[sys.argv.index("-clang-tidy-binary") + 1]
 # Forwarded the way the real driver forwards them, so a stub can see what it was given.
 forward = ["-p", sys.argv[sys.argv.index("-path") + 1]]
 forward += [a for a in sys.argv if a.startswith("-checks=")]
+# -pN strips N leading path components, as the real driver's -p does: `+++ b/src/a.cpp`
+# under -p1 is src/a.cpp, and an unprefixed `+++ src/a.cpp` would be a.cpp.
+strip = next((int(a[2:]) for a in sys.argv if a[:2] == "-p" and a[2:].isdigit()), 0)
 files = [ln[4:].strip() for ln in sys.stdin if ln.startswith("+++ ")]
 rc = 0
 for f in files:
-    p = subprocess.run([binary, *forward, f.lstrip("b/")], capture_output=True, text=True)
+    p = subprocess.run([binary, *forward, "/".join(f.split("/")[strip:])], capture_output=True, text=True)
     sys.stdout.write(p.stdout); sys.stderr.write(p.stderr)
     rc = rc or p.returncode
 sys.exit(rc)
@@ -111,6 +114,13 @@ echo "clang_tidy.sh"
 setup; fake_driver; change_a_compiled_source
 CLANG_TIDY_BIN="$REPO/bin/ct-clean"  expect_rc 0 "diff: clean run exits 0" bash "$SUT" diff
 CLANG_TIDY_BIN="$REPO/bin/ct-find"   expect_rc 1 "diff: findings exit 1, the only downgradable status" bash "$SUT" diff
+# The git path's patch keeps git's default prefixes whatever the user's config: under
+# diff.noprefix an unpinned `+++ src/a.cpp` reaches the analyzer as a.cpp, after -p1.
+# This analyzer reports only on the file it was given, and fails on one that is not there.
+# shellcheck disable=SC2016  # expanded when the stub runs, not here
+stub seen 'f="${!#}"; [ -f "$f" ] || { echo "no such file: $f" >&2; exit 3; }; echo "$PWD/$f:2:1: warning: found [modernize-use-auto]"; exit 1'
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.noprefix GIT_CONFIG_VALUE_0=true CLANG_TIDY_BIN="$REPO/bin/ct-seen" \
+    expect_rc 1 "diff: the analyzer gets the changed file's path whatever the diff config" bash "$SUT" diff
 CLANG_TIDY_BIN="$REPO/bin/ct-crash"  expect_rc 2 "diff: a crash exits 2, never 1" bash "$SUT" diff
 CLANG_TIDY_BIN="$REPO/bin/ct-oldver" expect_rc 2 "diff: wrong analyzer version exits 2" bash "$SUT" diff
 CLANG_TIDY_BIN="$REPO/bin/ct-oldver" expect_rc 2 "check-tool: wrong version exits 2, not 1" bash "$SUT" check-tool
@@ -456,6 +466,113 @@ fi
 # compile database would be a verdict over nothing.
 expect_rc 2 "diff: a TMPDIR that cannot hold the deduplicated database exits 2" \
     env TMPDIR="$REPO/no-such-dir" bash "$SUT" diff
+
+# --- a tree without git: the snapshot ---------------------------------------
+# A CI job staged onto a build node gets the tracked files and no .git, so `diff`
+# reads what `snapshot` recorded where the history is. The copy below is that tree:
+# the same files, no .git, and a compile database that names the copy (on a node the
+# database is built there, so it always does).
+snapshot_tree() {
+    COPY="$(mktemp -d)"
+    cp -a "$REPO/." "$COPY/" && rm -rf "$COPY/.git"
+    sed -i "s|$REPO|$COPY|g" "$COPY/build/compile_commands.json"
+}
+
+setup; fake_driver; change_a_compiled_source
+export CLANG_TIDY_BIN="$REPO/bin/ct-find"
+expect_rc 0 "snapshot: writes the four answers" bash "$SUT" snapshot "$REPO/snap"
+if [ -s snap/ls-files.txt ] && grep -qx 'src/a.cpp' snap/changed.txt && grep -q '^+++ b/src/a.cpp' snap/diff.patch; then
+    ok "snapshot: the scope, the changed file and its changed lines"
+else
+    no "snapshot: the scope, the changed file and its changed lines" "$(ls -l snap 2>&1)"
+fi
+if [ "$(cat snap/changed.sha256)" = "$(sha256sum src/a.cpp)" ]; then
+    ok "snapshot: the changed file's hash, as sha256sum writes it"
+else
+    no "snapshot: the changed file's hash, as sha256sum writes it" "$(cat snap/changed.sha256 2>&1)"
+fi
+# The hash is of the state the range ends at: HEAD's file for a committed range, the
+# working tree's otherwise. An uncommitted edit tells the two apart.
+echo "// uncommitted" >> src/a.cpp
+bash "$SUT" snapshot "$REPO/snap-head" >/dev/null 2>&1
+CLANG_TIDY_COMMITTED=0 bash "$SUT" snapshot "$REPO/snap-wt" >/dev/null 2>&1
+if [ "$(cut -d' ' -f1 snap-head/changed.sha256)" = "$(git cat-file blob HEAD:src/a.cpp | sha256sum | cut -d' ' -f1)" ] \
+   && [ "$(cut -d' ' -f1 snap-wt/changed.sha256)" = "$(sha256sum < src/a.cpp | cut -d' ' -f1)" ]; then
+    ok "snapshot: hashes HEAD's file for a committed range, the working tree's otherwise"
+else
+    no "snapshot: hashes HEAD's file for a committed range, the working tree's otherwise" "$(cat snap-head/changed.sha256 snap-wt/changed.sha256 2>&1)"
+fi
+# A user's diff prefix config must not reach the patch: `+++ b/` is what is parsed.
+# diff.noprefix on a committed range, diff.mnemonicPrefix on a working-tree one.
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.noprefix GIT_CONFIG_VALUE_0=true \
+    bash "$SUT" snapshot "$REPO/snap-noprefix" >/dev/null 2>&1
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.mnemonicPrefix GIT_CONFIG_VALUE_0=true CLANG_TIDY_COMMITTED=0 \
+    bash "$SUT" snapshot "$REPO/snap-mnemonic" >/dev/null 2>&1
+if grep -q '^+++ b/src/a.cpp' snap-noprefix/diff.patch 2>/dev/null \
+   && grep -q '^+++ b/src/a.cpp' snap-mnemonic/diff.patch 2>/dev/null; then
+    ok "snapshot: the patch keeps git's default prefixes whatever the diff config"
+else
+    no "snapshot: the patch keeps git's default prefixes whatever the diff config" "$(grep -h '^+++' snap-noprefix/diff.patch snap-mnemonic/diff.patch 2>&1)"
+fi
+git checkout -q -- src/a.cpp
+if [ -f clang-tidy-status.txt ]; then
+    no "snapshot: publishes no analysis status" "clang-tidy-status.txt was written"
+else
+    ok "snapshot: publishes no analysis status"
+fi
+bash "$SUT" diff >/dev/null 2>&1; cp clang-tidy-report.txt "$REPO/git-report.txt"
+snapshot_tree; cd "$COPY" || exit 1
+expect_rc 1 "diff from a snapshot: the same finding, the same downgradable status" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" bash "$SUT" diff
+if cmp -s clang-tidy-report.txt "$REPO/git-report.txt"; then
+    ok "diff from a snapshot: the report is the one git gives"
+else
+    no "diff from a snapshot: the report is the one git gives" "$(diff "$REPO/git-report.txt" clang-tidy-report.txt | head -5)"
+fi
+expect_rc 0 "diff from a snapshot: a clean analyzer passes" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" CLANG_TIDY_BIN="$REPO/bin/ct-clean" bash "$SUT" diff
+expect_rc 2 "diff from a snapshot: a missing answer is no verdict, never a pass" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/absent" bash "$SUT" diff
+cp -a "$REPO/snap" "$REPO/snap-nohash" && rm "$REPO/snap-nohash/changed.sha256"
+expect_rc 2 "diff from a snapshot: one without the changed files' hashes is no verdict" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap-nohash" bash "$SUT" diff
+# Each of the other answers, missing alone, from an analyzer that would pass: a
+# snapshot without changed.txt would otherwise read as "nothing changed".
+for _f in ls-files.txt changed.txt diff.patch; do
+    cp -a "$REPO/snap" "$REPO/snap-no$_f" && rm "$REPO/snap-no$_f/$_f"
+    expect_rc 2 "diff from a snapshot: without $_f is no verdict" \
+        env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap-no$_f" CLANG_TIDY_BIN="$REPO/bin/ct-clean" bash "$SUT" diff
+done
+# Another tree than the snapshot's: the patch's line numbers would land on code
+# nobody changed, so there is no verdict, even from an analyzer that would pass.
+cp src/a.cpp "$REPO/a.cpp.orig"; sed -i '1i // not the tree the snapshot describes' src/a.cpp
+expect_rc 2 "diff from a snapshot: a tree that is not the snapshot's is no verdict, never a pass" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" CLANG_TIDY_BIN="$REPO/bin/ct-clean" bash "$SUT" diff
+cp "$REPO/a.cpp.orig" src/a.cpp
+expect_rc 1 "diff from a snapshot: the same tree again, the same verdict" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" bash "$SUT" diff
+cd "$REPO" || exit 1
+expect_rc 2 "snapshot: no diff base exits 2" env -u CLANG_TIDY_BASE bash "$SUT" snapshot "$REPO/snap2"
+
+# Only the compiled units' sections reach the analyzer: an uncompiled source changed
+# beside a compiled one is in the snapshot's diff and must be filtered out of it, as
+# git's own pathspec would leave it out.
+setup; fake_driver
+CLANG_TIDY_BASE="$(git rev-parse HEAD)"; export CLANG_TIDY_BASE
+echo "int y;" >> src/a.cpp; echo "int y;" >> src/Backend/skipped.cpp; git commit -qam both
+stub logargs "echo \"\$*\" >> \"$REPO/analyzed.log\"; exit 0"
+export CLANG_TIDY_BIN="$REPO/bin/ct-logargs"
+bash "$SUT" snapshot "$REPO/snap" >/dev/null 2>&1
+snapshot_tree; cd "$COPY" || exit 1
+: > "$REPO/analyzed.log"
+expect_rc 0 "diff from a snapshot: an uncompiled change beside a compiled one passes" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" bash "$SUT" diff
+if grep -q 'src/a.cpp' "$REPO/analyzed.log" && ! grep -q 'skipped.cpp' "$REPO/analyzed.log"; then
+    ok "diff from a snapshot: only the compiled unit's lines reach the analyzer"
+else
+    no "diff from a snapshot: only the compiled unit's lines reach the analyzer" "$(cat "$REPO/analyzed.log")"
+fi
+cd "$REPO" || exit 1
 
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

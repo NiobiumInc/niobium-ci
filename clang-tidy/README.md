@@ -314,3 +314,26 @@ Dependabot can raise these automatically with `package-ecosystem: gitsubmodule`.
 ecosystem covers *all* of them, so an unrestricted configuration in a repo carrying
 twenty-odd dependencies will open twenty-odd pull requests. Restrict it to this
 submodule, or bump by hand until that is confirmed.
+
+### Analyzing a tree that has no git history
+
+`diff` asks git three things: which files are in scope, which of them changed, and which
+lines. A job that builds somewhere other than where it checked out, from a copy of the
+tracked files with no `.git`, can't ask. Answer them where the history is, then hand the
+answers over with the tree:
+
+```sh
+# where the history is, with the CLANG_TIDY_* environment `make clang-tidy` passes
+bash .niobium-ci/clang-tidy/clang_tidy.sh snapshot "$SNAP"
+
+# where the tree is built: diff reads the snapshot instead of git
+CLANG_TIDY_GIT_SNAPSHOT="$SNAP" make clang-tidy
+```
+
+The snapshot is four small files: `ls-files.txt`, `changed.txt`, `diff.patch`, and
+`changed.sha256`, which holds each changed file's hash at the end of the range. `diff`
+refuses, with no verdict, a snapshot that is missing any of them, and a tree whose
+changed files don't match those hashes, because the patch's line numbers would then
+point at other code. The patch always uses git's default `a/` `b/` prefixes, whatever
+the diff configuration of the machine that wrote it.
+
