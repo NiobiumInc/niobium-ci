@@ -470,12 +470,29 @@ snapshot_tree() {
 
 setup; fake_driver; change_a_compiled_source
 export CLANG_TIDY_BIN="$REPO/bin/ct-find"
-expect_rc 0 "snapshot: writes the three answers" bash "$SUT" snapshot "$REPO/snap"
+expect_rc 0 "snapshot: writes the four answers" bash "$SUT" snapshot "$REPO/snap"
 if [ -s snap/ls-files.txt ] && grep -qx 'src/a.cpp' snap/changed.txt && grep -q '^+++ b/src/a.cpp' snap/diff.patch; then
     ok "snapshot: the scope, the changed file and its changed lines"
 else
     no "snapshot: the scope, the changed file and its changed lines" "$(ls -l snap 2>&1)"
 fi
+if [ "$(cat snap/changed.sha256)" = "$(sha256sum src/a.cpp)" ]; then
+    ok "snapshot: the changed file's hash, as sha256sum writes it"
+else
+    no "snapshot: the changed file's hash, as sha256sum writes it" "$(cat snap/changed.sha256 2>&1)"
+fi
+# The hash is of the state the range ends at: HEAD's file for a committed range, the
+# working tree's otherwise. An uncommitted edit tells the two apart.
+echo "// uncommitted" >> src/a.cpp
+bash "$SUT" snapshot "$REPO/snap-head" >/dev/null 2>&1
+CLANG_TIDY_COMMITTED=0 bash "$SUT" snapshot "$REPO/snap-wt" >/dev/null 2>&1
+if [ "$(cut -d' ' -f1 snap-head/changed.sha256)" = "$(git cat-file blob HEAD:src/a.cpp | sha256sum | cut -d' ' -f1)" ] \
+   && [ "$(cut -d' ' -f1 snap-wt/changed.sha256)" = "$(sha256sum < src/a.cpp | cut -d' ' -f1)" ]; then
+    ok "snapshot: hashes HEAD's file for a committed range, the working tree's otherwise"
+else
+    no "snapshot: hashes HEAD's file for a committed range, the working tree's otherwise" "$(cat snap-head/changed.sha256 snap-wt/changed.sha256 2>&1)"
+fi
+git checkout -q -- src/a.cpp
 if [ -f clang-tidy-status.txt ]; then
     no "snapshot: publishes no analysis status" "clang-tidy-status.txt was written"
 else
@@ -494,6 +511,17 @@ expect_rc 0 "diff from a snapshot: a clean analyzer passes" \
     env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" CLANG_TIDY_BIN="$REPO/bin/ct-clean" bash "$SUT" diff
 expect_rc 2 "diff from a snapshot: a missing answer is no verdict, never a pass" \
     env CLANG_TIDY_GIT_SNAPSHOT="$REPO/absent" bash "$SUT" diff
+cp -a "$REPO/snap" "$REPO/snap-nohash" && rm "$REPO/snap-nohash/changed.sha256"
+expect_rc 2 "diff from a snapshot: one without the changed files' hashes is no verdict" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap-nohash" bash "$SUT" diff
+# Another tree than the snapshot's: the patch's line numbers would land on code
+# nobody changed, so there is no verdict, even from an analyzer that would pass.
+cp src/a.cpp "$REPO/a.cpp.orig"; sed -i '1i // not the tree the snapshot describes' src/a.cpp
+expect_rc 2 "diff from a snapshot: a tree that is not the snapshot's is no verdict, never a pass" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" CLANG_TIDY_BIN="$REPO/bin/ct-clean" bash "$SUT" diff
+cp "$REPO/a.cpp.orig" src/a.cpp
+expect_rc 1 "diff from a snapshot: the same tree again, the same verdict" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" bash "$SUT" diff
 cd "$REPO" || exit 1
 expect_rc 2 "snapshot: no diff base exits 2" env -u CLANG_TIDY_BASE bash "$SUT" snapshot "$REPO/snap2"
 

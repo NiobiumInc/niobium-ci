@@ -22,9 +22,13 @@
 # tree that has no history: a CI job staged onto a build node gets the tracked files
 # and no .git. Written on the machine that has the history, with the same pathspec and
 # range `diff` would use there:
-#   ls-files.txt  the scope's tracked files            git ls-files -- SCOPE
-#   changed.txt   changed and not deleted, in scope    git diff --name-only --diff-filter=d RANGE -- SCOPE
-#   diff.patch    the changed lines, in scope          git diff -U0 RANGE -- SCOPE
+#   ls-files.txt    the scope's tracked files            git ls-files -- SCOPE
+#   changed.txt     changed and not deleted, in scope    git diff --name-only --diff-filter=d RANGE -- SCOPE
+#   diff.patch      the changed lines, in scope          git diff -U0 RANGE -- SCOPE
+#   changed.sha256  each changed file as RANGE ends,     sha256sum lines
+#                   checked out
+# `diff` refuses, with no verdict, a tree whose changed files are not what the
+# snapshot recorded: diff.patch's line numbers would land on other code.
 #
 # Configuration arrives in the environment; the consumer's Makefile owns the values.
 # No secrets are read, written or required.
@@ -158,16 +162,42 @@ flush()
 PY
 }
 
-# A snapshot is all three files or no verdict: a missing one would read as "nothing
-# changed" or "the scope is empty", and the first of those passes.
+# A snapshot is all four files or no verdict: a missing one would read as "nothing
+# changed" or "the scope is empty", and the first of those passes. And it must be a
+# snapshot of THIS tree: applied to other content -- a stale snapshot directory, a
+# re-staged copy -- diff.patch's line numbers point at lines nobody changed, and that
+# can pass too.
 check_snapshot() {
     [ -n "${CLANG_TIDY_GIT_SNAPSHOT:-}" ] || return 0
-    local f
-    for f in ls-files.txt changed.txt diff.patch; do
+    local f bad
+    for f in ls-files.txt changed.txt diff.patch changed.sha256; do
         if [ ! -f "$CLANG_TIDY_GIT_SNAPSHOT/$f" ]; then
             err "CLANG_TIDY_GIT_SNAPSHOT=$CLANG_TIDY_GIT_SNAPSHOT has no $f — write it with \`clang_tidy.sh snapshot\`."
             return 1
         fi
+    done
+    # Empty when nothing in scope changed, and sha256sum -c rejects an empty list.
+    [ -s "$CLANG_TIDY_GIT_SNAPSHOT/changed.sha256" ] || return 0
+    if ! bad="$(sha256sum -c --quiet --strict "$CLANG_TIDY_GIT_SNAPSHOT/changed.sha256" 2>&1)"; then
+        err "this tree is not the one the snapshot in $CLANG_TIDY_GIT_SNAPSHOT describes; its changed lines would land on other code:"
+        printf '%s\n' "$bad" | head -5 >&2
+        return 1
+    fi
+}
+
+# Each changed file, read from stdin, as the range ends and as a checkout writes it
+# (eol and smudge filters applied): HEAD's when the range is committed, the working
+# tree's otherwise. One `sha256sum` line each, for check_snapshot.
+snapshot_hashes() {
+    local f h
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        if [ "$CLANG_TIDY_COMMITTED" = "1" ]; then
+            h="$(git cat-file --filters "HEAD:$f" | sha256sum)" || return 1
+        else
+            h="$(sha256sum < "$f")" || return 1
+        fi
+        printf '%s  %s\n' "${h%% *}" "$f"
     done
 }
 
@@ -183,6 +213,10 @@ write_snapshot() {
     set_range
     if ! scope_files > "$dir/ls-files.txt" || ! changed_files > "$dir/changed.txt"; then
         err "git could not list the scope or the changed files for the snapshot."
+        return "$EX_NOVERDICT"
+    fi
+    if ! snapshot_hashes < "$dir/changed.txt" > "$dir/changed.sha256"; then
+        err "could not hash the changed files for the snapshot."
         return "$EX_NOVERDICT"
     fi
     # shellcheck disable=SC2086  # deliberate word splitting: a pathspec list
