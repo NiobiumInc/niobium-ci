@@ -13,9 +13,18 @@
 # ---------------------------------------------------------------------------
 #
 # Modes:
-#   check-tool  assert the analyzer on PATH is the expected version
-#   diff        analyze the lines changed against CLANG_TIDY_BASE
-#   all         analyze every in-scope translation unit
+#   check-tool    assert the analyzer on PATH is the expected version
+#   diff          analyze the lines changed against CLANG_TIDY_BASE
+#   all           analyze every in-scope translation unit
+#   snapshot DIR  write what `diff` asks git into DIR, for a `diff` run elsewhere
+#
+# CLANG_TIDY_GIT_SNAPSHOT names such a DIR. `diff` then reads it in place of git, for a
+# tree that has no history: a CI job staged onto a build node gets the tracked files
+# and no .git. Written on the machine that has the history, with the same pathspec and
+# range `diff` would use there:
+#   ls-files.txt  the scope's tracked files            git ls-files -- SCOPE
+#   changed.txt   changed and not deleted, in scope    git diff --name-only --diff-filter=d RANGE -- SCOPE
+#   diff.patch    the changed lines, in scope          git diff -U0 RANGE -- SCOPE
 #
 # Configuration arrives in the environment; the consumer's Makefile owns the values.
 # No secrets are read, written or required.
@@ -37,7 +46,7 @@
 #             run together cover what one `all` run does, without analyzing twice.
 set -uo pipefail
 
-MODE="${1:?usage: clang_tidy.sh check-tool|diff|all}"
+MODE="${1:?usage: clang_tidy.sh check-tool|diff|all|snapshot DIR}"
 HELPERS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 : "${CLANG_TIDY_VERSION:?}"
@@ -90,8 +99,98 @@ esac
 # error, it silently selects the wrong set. The subshell confines it.
 # --------------------------------------------------------------------------
 scope_files() {
+    if [ -n "${CLANG_TIDY_GIT_SNAPSHOT:-}" ]; then
+        cat "$CLANG_TIDY_GIT_SNAPSHOT/ls-files.txt"
+        return
+    fi
     # shellcheck disable=SC2086  # deliberate word splitting: a pathspec list
     ( set -f; git ls-files -- $CLANG_TIDY_SCOPE )
+}
+
+# --------------------------------------------------------------------------
+# The two other questions `diff` asks git, answered from a snapshot when there is one.
+# Committed state is what CI reviews; the working tree is what a developer is about to
+# commit. Both are useful, so the caller picks (CLANG_TIDY_COMMITTED).
+# --------------------------------------------------------------------------
+RANGE=()
+set_range() {
+    RANGE=("$CLANG_TIDY_BASE")
+    [ "$CLANG_TIDY_COMMITTED" = "1" ] && RANGE+=("HEAD")
+    return 0
+}
+
+# Changed and not deleted, in scope.
+changed_files() {
+    if [ -n "${CLANG_TIDY_GIT_SNAPSHOT:-}" ]; then
+        cat "$CLANG_TIDY_GIT_SNAPSHOT/changed.txt"
+        return
+    fi
+    # shellcheck disable=SC2086  # deliberate word splitting: a pathspec list
+    ( set -f; git diff --name-only --diff-filter=d "${RANGE[@]}" -- $CLANG_TIDY_SCOPE )
+}
+
+# The changed lines of the named files, as `git diff -U0` prints them. From a snapshot,
+# the sections of diff.patch whose new side is one of the files: the same text git
+# would print for those paths, in the same (path) order.
+changed_lines() {
+    if [ -z "${CLANG_TIDY_GIT_SNAPSHOT:-}" ]; then
+        git diff -U0 "${RANGE[@]}" -- "$@"
+        return
+    fi
+    python3 - "$CLANG_TIDY_GIT_SNAPSHOT/diff.patch" "$@" <<'PY'
+import sys
+want = set(sys.argv[2:])
+section, keep = [], False
+
+def flush():
+    if keep:
+        sys.stdout.write("".join(section))
+
+with open(sys.argv[1], encoding="utf-8", errors="surrogateescape") as patch:
+    for line in patch:
+        if line.startswith("diff --git "):
+            flush()
+            section, keep = [], False
+        elif line.startswith("+++ b/"):
+            keep = line[len("+++ b/"):].rstrip("\n") in want
+        section.append(line)
+flush()
+PY
+}
+
+# A snapshot is all three files or no verdict: a missing one would read as "nothing
+# changed" or "the scope is empty", and the first of those passes.
+check_snapshot() {
+    [ -n "${CLANG_TIDY_GIT_SNAPSHOT:-}" ] || return 0
+    local f
+    for f in ls-files.txt changed.txt diff.patch; do
+        if [ ! -f "$CLANG_TIDY_GIT_SNAPSHOT/$f" ]; then
+            err "CLANG_TIDY_GIT_SNAPSHOT=$CLANG_TIDY_GIT_SNAPSHOT has no $f — write it with \`clang_tidy.sh snapshot\`."
+            return 1
+        fi
+    done
+}
+
+# `snapshot DIR`: the three answers, from git, for a `diff` run on a tree without it.
+write_snapshot() {
+    local dir="$1"
+    # Always git here, whatever the environment names: a snapshot of a snapshot would
+    # be one of nothing.
+    local CLANG_TIDY_GIT_SNAPSHOT=""
+    [ -n "$dir" ] || { err "snapshot needs a directory: clang_tidy.sh snapshot DIR"; return "$EX_NOVERDICT"; }
+    [ -n "$CLANG_TIDY_BASE" ] || { err "CLANG_TIDY_BASE is empty — no diff base to compare against."; return "$EX_NOVERDICT"; }
+    mkdir -p "$dir" || return "$EX_NOVERDICT"
+    set_range
+    if ! scope_files > "$dir/ls-files.txt" || ! changed_files > "$dir/changed.txt"; then
+        err "git could not list the scope or the changed files for the snapshot."
+        return "$EX_NOVERDICT"
+    fi
+    # shellcheck disable=SC2086  # deliberate word splitting: a pathspec list
+    if ! ( set -f; git diff -U0 "${RANGE[@]}" -- $CLANG_TIDY_SCOPE ) > "$dir/diff.patch"; then
+        err "git could not diff the range for the snapshot."
+        return "$EX_NOVERDICT"
+    fi
+    echo "snapshot in $dir: $(wc -l < "$dir/ls-files.txt") in-scope file(s), $(wc -l < "$dir/changed.txt") changed"
 }
 
 # --------------------------------------------------------------------------
@@ -318,10 +417,7 @@ lint_diff() {
         return "$EX_NOVERDICT"
     fi
 
-    # Committed state is what CI reviews; the working tree is what a developer is
-    # about to commit. Both are useful, so the caller picks.
-    local -a range=("$CLANG_TIDY_BASE")
-    [ "$CLANG_TIDY_COMMITTED" = "1" ] && range+=("HEAD")
+    set_range
 
     # Restrict to changed files the build actually compiles. This replaces the
     # -iregex filter the driver would otherwise need: headers and uncompiled
@@ -330,7 +426,7 @@ lint_diff() {
     # hand-written scope exclusions.
     local -a tus=()
     # shellcheck disable=SC2086
-    mapfile -t tus < <( ( set -f; git diff --name-only --diff-filter=d "${range[@]}" -- $CLANG_TIDY_SCOPE ) | db_filter )
+    mapfile -t tus < <( changed_files | db_filter )
     : > clang-tidy-report.txt
     : > clang-tidy-stderr.txt
     if [ "${#tus[@]}" -eq 0 ]; then
@@ -343,7 +439,7 @@ lint_diff() {
     while IFS= read -r arg; do extra+=("-extra-arg-before=$arg"); done < <(toolchain_args)
     [ -n "$CHECKS" ] && extra+=("-checks=$CHECKS")
 
-    git diff -U0 "${range[@]}" -- "${tus[@]}" \
+    changed_lines "${tus[@]}" \
         | python3 "$driver" \
             -clang-tidy-binary "$CLANG_TIDY_BIN" \
             -p1 -path "$ANALYSIS_DB" -j "$(nproc)" \
@@ -514,13 +610,20 @@ run_mode() {
         check-tool) check_tool || return "$EX_NOVERDICT" ;;
         # The pre-flight checks mean the analysis did not run, so they report 2 rather
         # than falling through as if the code were clean.
-        diff)       check_tool && check_scope && check_compile_db && prepare || return "$EX_NOVERDICT"
+        diff)       check_snapshot && check_tool && check_scope && check_compile_db && prepare || return "$EX_NOVERDICT"
                     lint_diff ;;
         all)        check_tool && check_scope && check_compile_db && prepare || return "$EX_NOVERDICT"
                     lint_all ;;
         *)          err "unknown mode: $MODE"; return "$EX_NOVERDICT" ;;
     esac
 }
+
+# A snapshot is not an analysis: it publishes no status, so it cannot be mistaken for
+# one by a caller reading clang-tidy-status.txt.
+if [ "$MODE" = snapshot ]; then
+    write_snapshot "${2:-}"
+    exit $?
+fi
 
 # Removed first, so a status left by an earlier run cannot be read as this one's.
 rm -f "$STATUS_FILE"

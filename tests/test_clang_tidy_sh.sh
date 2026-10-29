@@ -457,5 +457,65 @@ fi
 expect_rc 2 "diff: a TMPDIR that cannot hold the deduplicated database exits 2" \
     env TMPDIR="$REPO/no-such-dir" bash "$SUT" diff
 
+# --- a tree without git: the snapshot ---------------------------------------
+# A CI job staged onto a build node gets the tracked files and no .git, so `diff`
+# reads what `snapshot` recorded where the history is. The copy below is that tree:
+# the same files, no .git, and a compile database that names the copy (on a node the
+# database is built there, so it always does).
+snapshot_tree() {
+    COPY="$(mktemp -d)"
+    cp -a "$REPO/." "$COPY/" && rm -rf "$COPY/.git"
+    sed -i "s|$REPO|$COPY|g" "$COPY/build/compile_commands.json"
+}
+
+setup; fake_driver; change_a_compiled_source
+export CLANG_TIDY_BIN="$REPO/bin/ct-find"
+expect_rc 0 "snapshot: writes the three answers" bash "$SUT" snapshot "$REPO/snap"
+if [ -s snap/ls-files.txt ] && grep -qx 'src/a.cpp' snap/changed.txt && grep -q '^+++ b/src/a.cpp' snap/diff.patch; then
+    ok "snapshot: the scope, the changed file and its changed lines"
+else
+    no "snapshot: the scope, the changed file and its changed lines" "$(ls -l snap 2>&1)"
+fi
+if [ -f clang-tidy-status.txt ]; then
+    no "snapshot: publishes no analysis status" "clang-tidy-status.txt was written"
+else
+    ok "snapshot: publishes no analysis status"
+fi
+bash "$SUT" diff >/dev/null 2>&1; cp clang-tidy-report.txt "$REPO/git-report.txt"
+snapshot_tree; cd "$COPY" || exit 1
+expect_rc 1 "diff from a snapshot: the same finding, the same downgradable status" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" bash "$SUT" diff
+if cmp -s clang-tidy-report.txt "$REPO/git-report.txt"; then
+    ok "diff from a snapshot: the report is the one git gives"
+else
+    no "diff from a snapshot: the report is the one git gives" "$(diff "$REPO/git-report.txt" clang-tidy-report.txt | head -5)"
+fi
+expect_rc 0 "diff from a snapshot: a clean analyzer passes" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" CLANG_TIDY_BIN="$REPO/bin/ct-clean" bash "$SUT" diff
+expect_rc 2 "diff from a snapshot: a missing answer is no verdict, never a pass" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/absent" bash "$SUT" diff
+cd "$REPO" || exit 1
+expect_rc 2 "snapshot: no diff base exits 2" env -u CLANG_TIDY_BASE bash "$SUT" snapshot "$REPO/snap2"
+
+# Only the compiled units' sections reach the analyzer: an uncompiled source changed
+# beside a compiled one is in the snapshot's diff and must be filtered out of it, as
+# git's own pathspec would leave it out.
+setup; fake_driver
+CLANG_TIDY_BASE="$(git rev-parse HEAD)"; export CLANG_TIDY_BASE
+echo "int y;" >> src/a.cpp; echo "int y;" >> src/Backend/skipped.cpp; git commit -qam both
+stub logargs "echo \"\$*\" >> \"$REPO/analyzed.log\"; exit 0"
+export CLANG_TIDY_BIN="$REPO/bin/ct-logargs"
+bash "$SUT" snapshot "$REPO/snap" >/dev/null 2>&1
+snapshot_tree; cd "$COPY" || exit 1
+: > "$REPO/analyzed.log"
+expect_rc 0 "diff from a snapshot: an uncompiled change beside a compiled one passes" \
+    env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap" bash "$SUT" diff
+if grep -q 'src/a.cpp' "$REPO/analyzed.log" && ! grep -q 'skipped.cpp' "$REPO/analyzed.log"; then
+    ok "diff from a snapshot: only the compiled unit's lines reach the analyzer"
+else
+    no "diff from a snapshot: only the compiled unit's lines reach the analyzer" "$(cat "$REPO/analyzed.log")"
+fi
+cd "$REPO" || exit 1
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
