@@ -492,6 +492,18 @@ if [ "$(cut -d' ' -f1 snap-head/changed.sha256)" = "$(git cat-file blob HEAD:src
 else
     no "snapshot: hashes HEAD's file for a committed range, the working tree's otherwise" "$(cat snap-head/changed.sha256 snap-wt/changed.sha256 2>&1)"
 fi
+# A user's diff prefix config must not reach the patch: `+++ b/` is what is parsed.
+# diff.noprefix on a committed range, diff.mnemonicPrefix on a working-tree one.
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.noprefix GIT_CONFIG_VALUE_0=true \
+    bash "$SUT" snapshot "$REPO/snap-noprefix" >/dev/null 2>&1
+GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.mnemonicPrefix GIT_CONFIG_VALUE_0=true CLANG_TIDY_COMMITTED=0 \
+    bash "$SUT" snapshot "$REPO/snap-mnemonic" >/dev/null 2>&1
+if grep -q '^+++ b/src/a.cpp' snap-noprefix/diff.patch 2>/dev/null \
+   && grep -q '^+++ b/src/a.cpp' snap-mnemonic/diff.patch 2>/dev/null; then
+    ok "snapshot: the patch keeps git's default prefixes whatever the diff config"
+else
+    no "snapshot: the patch keeps git's default prefixes whatever the diff config" "$(grep -h '^+++' snap-noprefix/diff.patch snap-mnemonic/diff.patch 2>&1)"
+fi
 git checkout -q -- src/a.cpp
 if [ -f clang-tidy-status.txt ]; then
     no "snapshot: publishes no analysis status" "clang-tidy-status.txt was written"
@@ -514,6 +526,13 @@ expect_rc 2 "diff from a snapshot: a missing answer is no verdict, never a pass"
 cp -a "$REPO/snap" "$REPO/snap-nohash" && rm "$REPO/snap-nohash/changed.sha256"
 expect_rc 2 "diff from a snapshot: one without the changed files' hashes is no verdict" \
     env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap-nohash" bash "$SUT" diff
+# Each of the other answers, missing alone, from an analyzer that would pass: a
+# snapshot without changed.txt would otherwise read as "nothing changed".
+for _f in ls-files.txt changed.txt diff.patch; do
+    cp -a "$REPO/snap" "$REPO/snap-no$_f" && rm "$REPO/snap-no$_f/$_f"
+    expect_rc 2 "diff from a snapshot: without $_f is no verdict" \
+        env CLANG_TIDY_GIT_SNAPSHOT="$REPO/snap-no$_f" CLANG_TIDY_BIN="$REPO/bin/ct-clean" bash "$SUT" diff
+done
 # Another tree than the snapshot's: the patch's line numbers would land on code
 # nobody changed, so there is no verdict, even from an analyzer that would pass.
 cp src/a.cpp "$REPO/a.cpp.orig"; sed -i '1i // not the tree the snapshot describes' src/a.cpp

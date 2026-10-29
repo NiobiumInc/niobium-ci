@@ -24,7 +24,7 @@
 # range `diff` would use there:
 #   ls-files.txt    the scope's tracked files            git ls-files -- SCOPE
 #   changed.txt     changed and not deleted, in scope    git diff --name-only --diff-filter=d RANGE -- SCOPE
-#   diff.patch      the changed lines, in scope          git diff -U0 RANGE -- SCOPE
+#   diff.patch      the changed lines, in scope          git diff -U0 RANGE -- SCOPE (a/ b/ prefixes)
 #   changed.sha256  each changed file as RANGE ends,     sha256sum lines
 #                   checked out
 # `diff` refuses, with no verdict, a tree whose changed files are not what the
@@ -138,7 +138,7 @@ changed_files() {
 # would print for those paths, in the same (path) order.
 changed_lines() {
     if [ -z "${CLANG_TIDY_GIT_SNAPSHOT:-}" ]; then
-        git diff -U0 "${RANGE[@]}" -- "$@"
+        git diff -U0 --src-prefix=a/ --dst-prefix=b/ "${RANGE[@]}" -- "$@"
         return
     fi
     python3 - "$CLANG_TIDY_GIT_SNAPSHOT/diff.patch" "$@" <<'PY'
@@ -219,8 +219,11 @@ write_snapshot() {
         err "could not hash the changed files for the snapshot."
         return "$EX_NOVERDICT"
     fi
+    # The prefixes are pinned: the parser below and clang-tidy-diff.py's -p1 read
+    # `+++ b/<path>`, and a user's diff.noprefix or diff.mnemonicPrefix would print
+    # `+++ <path>` or `+++ w/<path>`, which no section matches: no findings, silently.
     # shellcheck disable=SC2086  # deliberate word splitting: a pathspec list
-    if ! ( set -f; git diff -U0 "${RANGE[@]}" -- $CLANG_TIDY_SCOPE ) > "$dir/diff.patch"; then
+    if ! ( set -f; git diff -U0 --src-prefix=a/ --dst-prefix=b/ "${RANGE[@]}" -- $CLANG_TIDY_SCOPE ) > "$dir/diff.patch"; then
         err "git could not diff the range for the snapshot."
         return "$EX_NOVERDICT"
     fi
